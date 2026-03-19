@@ -116,6 +116,18 @@ def build_scatter_cov_layer1(obs_config="qp"):
     return jnp.array([[0.]])
 
 
+def _tile_to_patches(params_tuple, n_patches):
+    """Add leading n_patches dim to each param via broadcast_to (zero-copy).
+
+    Scalar () -> (n_patches,). Array (d,) -> (n_patches, d). Etc.
+    After p[patch_idx] inside JIT, the original shape is recovered.
+    """
+    return tuple(
+        jnp.broadcast_to(jnp.asarray(p)[None], (n_patches,) + jnp.asarray(p).shape)
+        for p in params_tuple
+    )
+
+
 class scaling_relations:
 
     def __init__(self,observable="q_mmf3",cnc_params=None,catalogue=None):
