@@ -46,12 +46,12 @@ ALENS_SCAN = np.linspace(0.8, 1.2, 10)
 SIGMA8_CONV = np.linspace(0.795, 0.825, 7)
 
 # Resolution sweeps
-NPTS_2D = [64, 96, 128]
+NPTS_2D = [32, 64]
 NPTS_1D = [64, 128, 256, 512]
 NPTS_PERF = [64, 128, 256]
 
 # Accuracy: which (mode, npts) combos to test
-ACC_COMBOS = [("1d", 128), ("1d", 256), ("1d", 512), ("2d", 96), ("2d", 128)]
+ACC_COMBOS = [("1d", 128), ("1d", 256), ("1d", 512), ("2d", 32), ("2d", 64)]
 
 N_PERF_EVAL = 10
 

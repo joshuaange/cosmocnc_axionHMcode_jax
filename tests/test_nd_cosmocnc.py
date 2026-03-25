@@ -86,14 +86,15 @@ def main():
     t_start = time.time()
     results = {}
 
-    # ── Section 1: Parameter scans at npts=128 ──
+    # ── Section 1: Parameter scans at npts=96 (2d) / 128 (1d) ──
     print("=" * 60)
     print("SECTION 1: PARAMETER SCANS (cosmocnc)")
     print("=" * 60)
 
+    scan_npts = {"2d": 64, "1d": 128}
     scan_results = {}
     for mode in ["2d", "1d"]:
-        nc = get_instance(mode, 128)
+        nc = get_instance(mode, scan_npts[mode])
         eval_log_lik(nc)  # warmup
         label = f"cosmocnc_{mode}"
         print(f"  sigma_8 scan: {label}")
@@ -124,12 +125,12 @@ def main():
 
     results["conv"] = conv
 
-    # ── Section 3: 1D vs 2D (reuse npts=128) ──
+    # ── Section 3: 1D vs 2D (reuse npts=96/128) ──
     print("\n" + "=" * 60)
     print("SECTION 3: 1D vs 2D (cosmocnc)")
     print("=" * 60)
 
-    nc_2d = get_instance("2d", 128)
+    nc_2d = get_instance("2d", 64)
     nc_1d = get_instance("1d", 128)
     results["fiducial_2d"] = eval_log_lik(nc_2d)
     results["fiducial_1d"] = eval_log_lik(nc_1d)
@@ -160,8 +161,9 @@ def main():
     print("=" * 60)
 
     perf = {}
+    perf_npts = {"1d": 128, "2d": 64}
     for mode in ["1d", "2d"]:
-        nc = get_instance(mode, 128)
+        nc = get_instance(mode, perf_npts[mode])
         eval_log_lik(nc)  # warmup
         times = []
         for _ in range(3):
