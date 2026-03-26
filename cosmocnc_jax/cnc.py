@@ -28,11 +28,17 @@ def _tile_to_patches(params_tuple, n_patches):
 
     Scalar () -> (n_patches,). Array (d,) -> (n_patches, d). Etc.
     After p[patch_idx] inside JIT, the original shape is recovered.
+
+    If a param already has n_patches as its first dimension, it is kept as-is
+    (supports per-patch data like sigma matrices).  The shape check is
+    Python-level (trace-time only) so the JIT graph is unchanged.
     """
-    return tuple(
-        jnp.broadcast_to(jnp.asarray(p)[None], (n_patches,) + jnp.asarray(p).shape)
-        for p in params_tuple
-    )
+    def _tile_one(p):
+        p = jnp.asarray(p)
+        if p.ndim >= 1 and p.shape[0] == n_patches:
+            return p  # already per-patch
+        return jnp.broadcast_to(p[None], (n_patches,) + p.shape)
+    return tuple(_tile_one(p) for p in params_tuple)
 
 
 def _bilinear_interp_3d(xi0, xi1, patch_idx, tensor, x0_start, dx0, n0, x1_start, dx1, n1):
@@ -259,7 +265,8 @@ def build_backward_conv_nd(layer0_fns, layer1_fns, layer0_returns_aux_list, n_ob
 
 
 def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
-                        pref_fns, n_psr_list, n_pts):
+                        pref_fns, n_psr_list, n_pts,
+                        n_pc_l0_list=(0, 0), n_pc_l1_list=(0, 0)):
     """Factory: forward pass for 2D backward conv (separate JIT stage A).
 
     Computes per-cluster: lnM grid → prefactors → layer-0 → layer-1 → residuals.
@@ -268,8 +275,9 @@ def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
 
     def per_cluster(mn, mx, obs_vals,
                     E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                    H0, D_CMB, gamma,
+                    H0, D_CMB, gamma, z_c,
                     all_pref_sr, all_layer0_sr, all_layer1_sr,
+                    all_layer0_sr_pc, all_layer1_sr_pc,
                     patch_idx):
         lnM = jnp.linspace(mn, mx, n_pts)
 
@@ -281,9 +289,11 @@ def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
             psr_j = tuple(p[patch_idx] for p in all_pref_sr[j])
             l0_j = tuple(p[patch_idx] for p in all_layer0_sr[j])
             l1_j = tuple(p[patch_idx] for p in all_layer1_sr[j])
+            l0_pc_j = all_layer0_sr_pc[j]
+            l1_pc_j = all_layer1_sr_pc[j]
             prefactors = pref_fns[j](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                                     H0, D_CMB, gamma, *psr_j)
-            layer0_args = prefactors + l0_j
+                                     H0, D_CMB, gamma, z_c, *psr_j)
+            layer0_args = prefactors + l0_j + l0_pc_j
 
             if layer0_returns_aux_list[j]:
                 x_l0_j, _ = layer0_fns[j](lnM, *layer0_args)
@@ -294,8 +304,9 @@ def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
             x_l0_lin = jnp.linspace(x_l0_j[0], x_l0_j[-1], n_pts)
             x_l0_lin_list.append(x_l0_lin)
 
-            if len(l1_j) > 0:
-                x_l1_j = layer1_fns[j](x_l0_lin, *l1_j)
+            layer1_args = prefactors + l1_j + l1_pc_j
+            if len(layer1_args) > 0:
+                x_l1_j = layer1_fns[j](x_l0_lin, *layer1_args)
             else:
                 x_l1_j = layer1_fns[j](x_l0_lin)
 
@@ -319,10 +330,12 @@ def build_2d_forward_fn(layer0_fns, layer1_fns, layer0_returns_aux_list,
         0, 0,               # mn, mx
         0,                  # obs_vals (batch, 2)
         0, 0, 0, 0,        # cosmo per-cluster
-        None, None, None,   # cosmo scalars
+        None, None, None, 0,  # cosmo scalars + z_c (per-cluster)
         tuple([tuple([None]*n) for n in n_psr_list]),  # all_pref_sr (n_patches, ...)
         tuple([None]*2),    # all_layer0_sr (n_patches, ...)
         tuple([None]*2),    # all_layer1_sr (n_patches, ...)
+        tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l0_list]),  # per-cluster L0
+        tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l1_list]),  # per-cluster L1
         0,                  # patch_idx (per-cluster)
     )
 
@@ -420,7 +433,7 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
         layer0_fns, layer1_fns, layer0_returns_aux_list, n_sub, nd_circular)
 
     def per_cluster(mn, mx, obs_vals, E_z, D_A, D_l_CMB, rho_c,
-                    H0, D_CMB, gamma,
+                    H0, D_CMB, gamma, z_c,
                     all_pref_sr, all_layer0_sr, all_layer1_sr,
                     cov_l0, cov_l1, apply_cut, cut_val,
                     patch_idx):
@@ -432,16 +445,16 @@ def build_sub_bc_jit(layer0_fns, layer1_fns, layer0_returns_aux_list,
             l0_k = tuple(p[patch_idx] for p in all_layer0_sr[k])
             l1_k = tuple(p[patch_idx] for p in all_layer1_sr[k])
             prefs = pref_fns[k](E_z, D_A, D_l_CMB, rho_c,
-                                H0, D_CMB, gamma, *psr_k)
+                                H0, D_CMB, gamma, z_c, *psr_k)
             layer0_args.append(prefs + l0_k)
-            layer1_args.append(l1_k)
+            layer1_args.append(prefs + l1_k)
         return bc_fn(lnM, obs_vals, tuple(layer0_args), tuple(layer1_args),
                      cov_l0, cov_l1, n_pts, apply_cut, cut_val)
 
     vmap_in = (
         0, 0, 0,                                         # mn, mx, obs_vals
         0, 0, 0, 0,                                      # cosmo per-cluster
-        None, None, None,                                 # H0, D_CMB, gamma
+        None, None, None, 0,                              # H0, D_CMB, gamma, z_c
         tuple([tuple([None]*n) for n in n_psr_list]),     # all_pref_sr (n_patches, ...)
         tuple([None]*n_sub),                              # all_layer0_sr (n_patches, ...)
         tuple([None]*n_sub),                              # all_layer1_sr (n_patches, ...)
@@ -848,6 +861,7 @@ class cluster_number_counts:
         self._bc_set_fns = []      # list of (bc_fn, obs_names) per correlation set
         self._bc_set_obs = []      # list of obs_name lists per correlation set
         self._all_sets_are_1d = True  # fast-path flag
+        self._1layer_obs_list = []   # 1-layer observables (direct PDF, no backward conv)
 
         for observable_set in self.cnc_params["observables"]:
             # Filter to observables with >= 2 layers (backward conv applicable)
@@ -858,7 +872,12 @@ class cluster_number_counts:
                     bc_obs_in_set.append(obs_name)
                     if obs_name not in self._bc_obs_list:
                         self._bc_obs_list.append(obs_name)
+                elif sr.get_n_layers() == 1:
+                    if obs_name not in self._1layer_obs_list:
+                        self._1layer_obs_list.append(obs_name)
 
+            if len(bc_obs_in_set) == 0 and len(self._1layer_obs_list) == 0:
+                continue
             if len(bc_obs_in_set) == 0:
                 continue
 
@@ -983,8 +1002,15 @@ class cluster_number_counts:
                 l0_aux = [self.scaling_relations[o].get_layer_returns_aux(0) for o in obs_names]
                 p_fns = [self.scaling_relations[o].get_prefactor_fn_unified() for o in obs_names]
                 p_nsr = [self.scaling_relations[o].get_n_prefactor_sr_params() for o in obs_names]
+                _pc_l0_counts = [len(self.scaling_relations[o].get_layer_sr_params_per_cluster(0, self.scal_rel_params))
+                                 if hasattr(self.scaling_relations[o], 'get_layer_sr_params_per_cluster') else 0
+                                 for o in obs_names]
+                _pc_l1_counts = [len(self.scaling_relations[o].get_layer_sr_params_per_cluster(1, self.scal_rel_params))
+                                 if hasattr(self.scaling_relations[o], 'get_layer_sr_params_per_cluster') else 0
+                                 for o in obs_names]
                 self._2d_forward_jits[s_idx] = build_2d_forward_fn(
-                    l0_fns, l1_fns, l0_aux, p_fns, p_nsr, n_points_dl)
+                    l0_fns, l1_fns, l0_aux, p_fns, p_nsr, n_points_dl,
+                    _pc_l0_counts, _pc_l1_counts)
                 nd_circ = self.cnc_params.get("nd_convolution_mode", "linear") == "circular"
                 self._2d_conv_jits[s_idx] = build_2d_conv_fn(n_points_dl, nd_circular=nd_circ)
                 self._2d_core_obs_indices[s_idx] = [
@@ -1021,9 +1047,15 @@ class cluster_number_counts:
                     sub_npsr = [self.scaling_relations[o].get_n_prefactor_sr_params()
                                 for o in sub_obs]
                     if r == 2:
+                        sub_pc_l0 = [len(self.scaling_relations[o].get_layer_sr_params_per_cluster(0, self.scal_rel_params))
+                                     if hasattr(self.scaling_relations[o], 'get_layer_sr_params_per_cluster') else 0
+                                     for o in sub_obs]
+                        sub_pc_l1 = [len(self.scaling_relations[o].get_layer_sr_params_per_cluster(1, self.scal_rel_params))
+                                     if hasattr(self.scaling_relations[o], 'get_layer_sr_params_per_cluster') else 0
+                                     for o in sub_obs]
                         fwd = build_2d_forward_fn(
                             sub_l0, sub_l1, sub_aux, sub_pref, sub_npsr,
-                            n_points_dl)
+                            n_points_dl, sub_pc_l0, sub_pc_l1)
                         conv = build_2d_conv_fn(n_points_dl, nd_circular=nd_circ)
                         self._sub_bc_jits[(s_idx, sub_indices)] = {
                             'type': '2d_split', 'fwd_jit': fwd, 'conv_jit': conv,
@@ -1042,15 +1074,21 @@ class cluster_number_counts:
         # For 1D sets, computes backward conv inline.
         def _make_allinone_bc(s_bc_fns, s_pref_fns, s_n_psr, s_sizes, s_obs_idx,
                                f_pref_fns, f_n_psr, n_pts, n_o, n_s, n_drop,
-                               s_is_nd_flags):
+                               s_is_nd_flags, n_pc_l0, n_pc_l1,
+                               f_layer0_fns_1layer, f_pref_fns_1layer, n_1layer,
+                               n_psr_1layer, n_pc_l0_1layer):
             def per_cluster(mn, mx, obs_vals, has_obs_vals, hz, skyfrac,
                             E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                            H0, D_CMB, gamma,
+                            H0, D_CMB, gamma, z_c,
                             all_pref_sr, all_layer0_sr, all_layer1_sr,
+                            all_layer0_sr_pc, all_layer1_sr_pc,
                             all_cov_layer0, all_cov_layer1,
                             all_apply_cut, all_cut_val,
                             lnM0_min, lnM0_max, n_lnM0,
                             patch_idx,
+                            obs_vals_1layer, has_obs_1layer,
+                            all_pref_sr_1layer, all_layer0_sr_1layer,
+                            all_layer0_sr_pc_1layer, all_cov_1layer,
                             pre_nd_cpdfs):
                 # Shared: lnM grid and HMF interp (computed once)
                 lnM = jnp.linspace(mn, mx, n_pts)
@@ -1080,10 +1118,13 @@ class cluster_number_counts:
                             psr_i = tuple(p[patch_idx] for p in all_pref_sr[i])
                             l0_i = tuple(p[patch_idx] for p in all_layer0_sr[i])
                             l1_i = tuple(p[patch_idx] for p in all_layer1_sr[i])
+                            # Per-cluster params (already sliced by vmap)
+                            l0_pc_i = all_layer0_sr_pc[i]
+                            l1_pc_i = all_layer1_sr_pc[i]
                             prefactors = f_pref_fns[i](E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                                                        H0, D_CMB, gamma, *psr_i)
-                            set_layer0_args.append(prefactors + l0_i)
-                            set_layer1_args.append(l1_i)
+                                                        H0, D_CMB, gamma, z_c, *psr_i)
+                            set_layer0_args.append(prefactors + l0_i + l0_pc_i)
+                            set_layer1_args.append(prefactors + l1_i + l1_pc_i)
                             set_obs.append(obs_vals[idx[k]])
 
                         set_obs_arr = jnp.array(set_obs)
@@ -1095,6 +1136,25 @@ class cluster_number_counts:
                             n_pts, all_apply_cut[s], all_cut_val[s])
 
                     cpdf_product = cpdf_product * jnp.where(any_has, cpdf, 1.)
+
+                # 1-layer observables: direct Gaussian PDF (no backward conv)
+                # Matches cosmocnc lines 771-781
+                for ol_idx in range(n_1layer):
+                    ol_obs_val = obs_vals_1layer[ol_idx]
+                    ol_has = has_obs_1layer[ol_idx]
+                    psr_ol = tuple(p[patch_idx] for p in all_pref_sr_1layer[ol_idx])
+                    l0_ol = tuple(p[patch_idx] for p in all_layer0_sr_1layer[ol_idx])
+                    l0_pc_ol = all_layer0_sr_pc_1layer[ol_idx]
+                    prefactors_ol = f_pref_fns_1layer[ol_idx](
+                        E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
+                        H0, D_CMB, gamma, z_c, *psr_ol)
+                    layer0_args_ol = prefactors_ol + l0_ol + l0_pc_ol
+                    predicted = f_layer0_fns_1layer[ol_idx](lnM, *layer0_args_ol)
+                    residual = predicted - ol_obs_val
+                    cov_ol = all_cov_1layer[ol_idx]
+                    # Gaussian PDF: N(residual; 0, cov) = exp(-0.5*r^2/cov) / sqrt(2*pi*cov)
+                    cpdf_1l = jnp.exp(-0.5 * residual**2 / cov_ol) / jnp.sqrt(2. * jnp.pi * cov_ol)
+                    cpdf_product = cpdf_product * jnp.where(ol_has, cpdf_1l, 1.)
 
                 cwh = cpdf_product * hmf * 4. * jnp.pi * skyfrac
                 if n_drop > 0:
@@ -1110,24 +1170,64 @@ class cluster_number_counts:
                 1, 1,       # obs_vals (n_obs, n_bc), has_obs_vals (n_obs, n_bc)
                 0, 0,       # hz, skyfrac
                 0, 0, 0, 0, # cosmo per-cluster
-                None, None, None,  # H0, D_CMB, gamma
+                None, None, None, 0,  # H0, D_CMB, gamma, z_c
                 tuple([tuple([None]*n) for n in f_n_psr]),  # all_pref_sr (n_patches, ...)
                 tuple([None]*n_o),  # all_layer0_sr (n_patches, ...)
                 tuple([None]*n_o),  # all_layer1_sr (n_patches, ...)
+                tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l0]),  # per-cluster L0
+                tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l1]),  # per-cluster L1
                 tuple([None]*n_s),  # all_cov_layer0 (per-set)
                 tuple([None]*n_s),  # all_cov_layer1 (per-set)
                 tuple([None]*n_s),  # all_apply_cut (per-set)
                 tuple([None]*n_s),  # all_cut_val (per-set)
                 None, None, None,   # lnM0_min, lnM0_max, n_lnM0
                 0,                  # patch_idx (per-cluster)
+                # 1-layer observables (obs_vals/has always (max(n_1layer,1), n_bc), axis 1)
+                1, 1,  # obs_vals_1layer, has_obs_1layer
+                tuple([tuple([None]*n) for n in n_psr_1layer]) if n_1layer > 0 else (),
+                tuple([None]*n_1layer) if n_1layer > 0 else (),
+                tuple([tuple([0]*n) if n > 0 else () for n in n_pc_l0_1layer]) if n_1layer > 0 else (),
+                tuple([None]*n_1layer) if n_1layer > 0 else (),
+                # end 1-layer
                 tuple([0]*n_s),     # pre_nd_cpdfs: all vmapped on axis 0
             )
             return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in)), per_cluster
 
+        # Count per-cluster params per observable
+        _n_pc_l0 = []
+        _n_pc_l1 = []
+        for o in self._bc_obs_list:
+            sr = self.scaling_relations[o]
+            if hasattr(sr, 'get_layer_sr_params_per_cluster'):
+                _n_pc_l0.append(len(sr.get_layer_sr_params_per_cluster(0, self.scal_rel_params)))
+                _n_pc_l1.append(len(sr.get_layer_sr_params_per_cluster(1, self.scal_rel_params)))
+            else:
+                _n_pc_l0.append(0)
+                _n_pc_l1.append(0)
+
+        # Build 1-layer observable data
+        _1layer_l0_fns = []
+        _1layer_pref_fns = []
+        _1layer_n_psr = []
+        _1layer_n_pc_l0 = []
+        for o in self._1layer_obs_list:
+            sr = self.scaling_relations[o]
+            _1layer_l0_fns.append(sr.get_layer_fn(0))
+            _1layer_pref_fns.append(sr.get_prefactor_fn_unified())
+            _1layer_n_psr.append(sr.get_n_prefactor_sr_params())
+            if hasattr(sr, 'get_layer_sr_params_per_cluster'):
+                _1layer_n_pc_l0.append(len(sr.get_layer_sr_params_per_cluster(0, self.scal_rel_params)))
+            else:
+                _1layer_n_pc_l0.append(0)
+        n_1layer = len(self._1layer_obs_list)
+
         self._allinone_bc_jit, self._allinone_bc_per_cluster = _make_allinone_bc(
             set_bc_fns, set_pref_fns, set_n_psr, set_sizes, set_obs_indices,
             flat_pref_fn_list, flat_n_psr_list, n_points_dl,
-            n_obs_bc, n_sets, n_drop_int, s_is_nd)
+            n_obs_bc, n_sets, n_drop_int, s_is_nd,
+            _n_pc_l0, _n_pc_l1,
+            _1layer_l0_fns, _1layer_pref_fns, n_1layer,
+            _1layer_n_psr, _1layer_n_pc_l0)
 
         # ── 4c. Merged mass_range with prefactors JIT ──
         mass_range_fn_inner = self._mass_range_fn
@@ -1137,7 +1237,7 @@ class cluster_number_counts:
         def _make_mass_range_with_pref(mr_fn, pref_fn_i, n_psr_i):
             def per_cluster(obs_val,
                             E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                            H0, D_CMB, gamma,
+                            H0, D_CMB, gamma, z_c,
                             ref_pref_sr,
                             ref_layer0_sr, ref_layer1_sr,
                             ref_layer0_deriv_sr, ref_layer1_deriv_sr,
@@ -1151,16 +1251,17 @@ class cluster_number_counts:
                 l1d = tuple(p[patch_idx] for p in ref_layer1_deriv_sr)
                 scat = ref_scatter[patch_idx]
                 ref_prefactors = pref_fn_i(E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                                           H0, D_CMB, gamma, *psr)
+                                           H0, D_CMB, gamma, z_c, *psr)
                 layer0_args = ref_prefactors + l0
+                layer1_args = ref_prefactors + l1
                 return mr_fn(lnM_coarse, obs_val,
-                             layer0_args, l1,
+                             layer0_args, layer1_args,
                              l0d, l1d,
                              scat, sigma_mass_prior,
                              lnM0_min, lnM0_max)
             vmap_in = (0,                         # obs_val
                        0, 0, 0, 0,                # cosmo per-cluster
-                       None, None, None,           # cosmo scalars
+                       None, None, None, 0,        # cosmo scalars + z_c (per-cluster)
                        tuple([None]*n_psr_i),      # ref_pref_sr (n_patches, ...)
                        None, None, None, None,     # layer sr + deriv (n_patches, ...)
                        None, None,                 # scatter (n_patches,), sigma_mp
@@ -1193,17 +1294,13 @@ class cluster_number_counts:
             n_layers_sel, n_points_abund)
 
         # Build vmap axes for all_layer_args (nested tuple)
-        # Layer 0: prefactors (per-z axis 0) + sr_params (shared None)
-        # Layer k>0: sr_params only (shared None)
+        # All layers: prefactors (per-z axis 0) + sr_params (shared None)
         dummy_sr = self.scal_rel_params
         z_layer_args_axes = []
         for k in range(n_layers_sel):
             sr_k = sr_sel.get_layer_sr_params(k, dummy_sr)
             n_sr_k = len(sr_k)
-            if k == 0:
-                z_layer_args_axes.append(tuple([0] * self._n_pref_sel + [None] * n_sr_k))
-            else:
-                z_layer_args_axes.append(tuple([None] * n_sr_k) if n_sr_k > 0 else ())
+            z_layer_args_axes.append(tuple([0] * self._n_pref_sel + [None] * n_sr_k))
         z_layer_args_axes = tuple(z_layer_args_axes)
 
         z_deriv_axes = []
@@ -1233,10 +1330,7 @@ class cluster_number_counts:
         for k in range(n_layers_sel):
             sr_k = sr_sel.get_layer_sr_params(k, dummy_sr)
             n_sr_k = len(sr_k)
-            if k == 0:
-                p_layer_args_axes.append(tuple([0] * (self._n_pref_sel + n_sr_k)))
-            else:
-                p_layer_args_axes.append(tuple([0] * n_sr_k) if n_sr_k > 0 else ())
+            p_layer_args_axes.append(tuple([0] * (self._n_pref_sel + n_sr_k)))
         p_layer_args_axes = tuple(p_layer_args_axes)
 
         # Deriv args: also per-patch (axis 0) in patch vmap
@@ -1563,6 +1657,7 @@ class cluster_number_counts:
             "D_A": self.D_A, "D_CMB": jnp.float64(self.cosmology.D_CMB),
             "D_l_CMB": self.D_l_CMB, "rho_c": self.rho_c,
             "gamma": jnp.float64(gamma),
+            "z": self.redshift_vec,
         }
 
         # Compute prefactors for all redshifts (vmapped)
@@ -1570,14 +1665,11 @@ class cluster_number_counts:
         prefactors = self._pref_vmaps[obs_select](*pref_args)  # tuple of (n_z,) arrays
 
         # Build all_layer_args: tuple of n_layers tuples
-        # Layer 0: prefactors + sr_params; Layer k>0: sr_params
+        # All layers receive: prefactors + sr_params (matching cosmocnc's other_params)
         all_layer_args_list = []
         for k in range(self._n_layers_sel):
             sr_params_k = sr_sel.get_layer_sr_params(k, self.scal_rel_params)
-            if k == 0:
-                all_layer_args_list.append(prefactors + sr_params_k)
-            else:
-                all_layer_args_list.append(sr_params_k)
+            all_layer_args_list.append(prefactors + sr_params_k)
         all_layer_args = tuple(all_layer_args_list)
 
         # Build all_deriv_args
@@ -1621,14 +1713,11 @@ class cluster_number_counts:
         # Default: tile (zero-copy broadcast). Multi-patch surveys can
         # override get_layer_sr_params to return genuinely per-patch data.
         all_layer_args_patched_list = []
+        patched_pref = _tile_to_patches(prefactors, self.n_patches)
         for k in range(self._n_layers_sel):
             sr_params_k_patched = _tile_to_patches(
                 sr_sel.get_layer_sr_params(k, self.scal_rel_params), self.n_patches)
-            if k == 0:
-                patched_pref = _tile_to_patches(prefactors, self.n_patches)
-                all_layer_args_patched_list.append(patched_pref + sr_params_k_patched)
-            else:
-                all_layer_args_patched_list.append(sr_params_k_patched)
+            all_layer_args_patched_list.append(patched_pref + sr_params_k_patched)
         all_layer_args_patched = tuple(all_layer_args_patched_list)
 
         # Deriv args: also per-patch
@@ -1906,10 +1995,7 @@ class cluster_number_counts:
                 hmf_matrix_ds, z_min_grid, z_max_grid, n_z_grid)
 
             # ── Stage 2: Mass range (with prefactors computed inside JIT) ──
-            if self.cnc_params["delta_m_with_ref"] == True:
-                ref_sr_params = scal_rel_params_ref
-            else:
-                ref_sr_params = self.scal_rel_params
+            ref_sr_params = self.scal_rel_params
 
             n_p = self.n_patches
             ref_pref_sr = _tile_to_patches(sr_sel.get_prefactor_sr_params(ref_sr_params), n_p)
@@ -1927,7 +2013,7 @@ class cluster_number_counts:
             lnM_min, lnM_max = self._mass_range_with_pref_jit(
                 obs_sel_vals,
                 E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                H0_jnp, D_CMB_jnp, gamma_jnp,
+                H0_jnp, D_CMB_jnp, gamma_jnp, z_clusters,
                 ref_pref_sr,
                 ref_layer0_sr, ref_layer1_sr,
                 ref_layer0_deriv_sr, ref_layer1_deriv_sr,
@@ -1949,6 +2035,21 @@ class cluster_number_counts:
                 for o in self._bc_obs_list)
             all_layer1_sr = tuple(
                 _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(1, self.scal_rel_params), n_p)
+                for o in self._bc_obs_list)
+
+            # Per-cluster SR params (vmapped over cluster axis, NOT tiled to patches)
+            # These are (n_cat, ...) arrays sliced to bc clusters via idx_bc.
+            def _get_pc(o, k):
+                sr = self.scaling_relations[o]
+                if hasattr(sr, 'get_layer_sr_params_per_cluster'):
+                    return sr.get_layer_sr_params_per_cluster(k, self.scal_rel_params)
+                return ()
+            n_cat = len(self.catalogue.catalogue["z"])
+            all_layer0_sr_pc = tuple(
+                tuple(jnp.asarray(p)[idx_bc] for p in _get_pc(o, 0))
+                for o in self._bc_obs_list)
+            all_layer1_sr_pc = tuple(
+                tuple(jnp.asarray(p)[idx_bc] for p in _get_pc(o, 1))
                 for o in self._bc_obs_list)
 
             # Per-correlation-set: covariance matrices, cutoff config
@@ -1990,11 +2091,45 @@ class cluster_number_counts:
             n_points_dl = int(self.cnc_params["n_points_data_lik"])
 
             # Shared (non-per-cluster) args for all-in-one
-            shared_args = (H0_jnp, D_CMB_jnp, gamma_jnp,
-                           all_pref_sr, all_layer0_sr, all_layer1_sr,
+            shared_args = (all_pref_sr, all_layer0_sr, all_layer1_sr,
                            all_cov_layer0, all_cov_layer1,
                            all_apply_cut_sets, all_cut_val_sets,
                            lnM0_min, lnM0_max, n_lnM0)
+            # Per-cluster args (vmapped on axis 0)
+            pc_args = (all_layer0_sr_pc, all_layer1_sr_pc)
+
+            # 1-layer observable data
+            n_1l = len(self._1layer_obs_list)
+            if n_1l > 0:
+                obs_vals_1l = jnp.stack([
+                    jnp.asarray(self.catalogue.catalogue[o])[idx_bc]
+                    for o in self._1layer_obs_list])  # (n_1l, n_bc)
+                has_obs_1l = jnp.stack([
+                    ~jnp.isnan(jnp.asarray(self.catalogue.catalogue[o])[idx_bc])
+                    for o in self._1layer_obs_list])  # (n_1l, n_bc)
+                pref_sr_1l = tuple(
+                    _tile_to_patches(self.scaling_relations[o].get_prefactor_sr_params(
+                        self.scal_rel_params), n_p)
+                    for o in self._1layer_obs_list)
+                l0_sr_1l = tuple(
+                    _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(
+                        0, self.scal_rel_params), n_p)
+                    for o in self._1layer_obs_list)
+                l0_pc_1l = tuple(
+                    tuple(jnp.asarray(p)[idx_bc] for p in _get_pc(o, 0))
+                    for o in self._1layer_obs_list)
+                cov_1l = tuple(
+                    jnp.float64(self.scatter.get_cov(
+                        observable1=o, observable2=o, layer=0, patch1=0, patch2=0))
+                    for o in self._1layer_obs_list)
+            else:
+                # Dummy (1, n_bc) arrays — loop runs 0 times so never accessed
+                obs_vals_1l = jnp.zeros((1, len(idx_bc)))
+                has_obs_1l = jnp.zeros((1, len(idx_bc)), dtype=jnp.bool_)
+                pref_sr_1l = ()
+                l0_sr_1l = ()
+                l0_pc_1l = ()
+                cov_1l = ()
 
             # ── Pattern-aware split-JIT: compute cpdfs for 2D+ sets ──
             # For each 2D+ correlation set, groups clusters by which observables
@@ -2002,8 +2137,9 @@ class cluster_number_counts:
             # 1D sets get dummy arrays (computed inline by the all-in-one JIT).
 
             def _dispatch_2d_split(fwd_jit, conv_jit, mn, mx, set_obs,
-                                   ez, da, dl, rc,
+                                   ez, da, dl, rc, zc,
                                    sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                   sub_l0_pc, sub_l1_pc,
                                    sub_cov_l0, sub_cov_l1,
                                    sub_apply_cut, sub_cut_val,
                                    patch_sub):
@@ -2012,8 +2148,9 @@ class cluster_number_counts:
                  x_lin_0_start, x_lin_1_start,
                  dx0_arr, dx1_arr) = fwd_jit(
                     mn, mx, set_obs, ez, da, dl, rc,
-                    H0_jnp, D_CMB_jnp, gamma_jnp,
+                    H0_jnp, D_CMB_jnp, gamma_jnp, zc,
                     sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                    sub_l0_pc, sub_l1_pc,
                     patch_sub)
 
                 det1 = sub_cov_l1[0, 0] * sub_cov_l1[1, 1] - sub_cov_l1[0, 1]**2
@@ -2123,10 +2260,21 @@ class cluster_number_counts:
                             set_obs = jnp.stack(
                                 [obs_data[sub_obs[j]][0][ci_g_jnp]
                                  for j in range(2)], axis=1)
+                            zc = z_clusters[ci_g_jnp]
+                            # Per-cluster data for this group
+                            sub_l0_pc = tuple(
+                                tuple(p[ci_g_jnp] for p in all_layer0_sr_pc[
+                                    self._bc_obs_list.index(o)])
+                                for o in sub_obs)
+                            sub_l1_pc = tuple(
+                                tuple(p[ci_g_jnp] for p in all_layer1_sr_pc[
+                                    self._bc_obs_list.index(o)])
+                                for o in sub_obs)
                             cpdf_sub = _dispatch_2d_split(
                                 jit_info['fwd_jit'], jit_info['conv_jit'],
-                                mn, mx, set_obs, ez, da, dl, rc,
+                                mn, mx, set_obs, ez, da, dl, rc, zc,
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
+                                sub_l0_pc, sub_l1_pc,
                                 sub_cov_l0, sub_cov_l1,
                                 sub_apply_cut, sub_cut_val,
                                 patch_sub)
@@ -2134,9 +2282,10 @@ class cluster_number_counts:
                             set_obs = jnp.stack(
                                 [obs_data[sub_obs[j]][0][ci_g_jnp]
                                  for j in range(n_sub)], axis=1)
+                            zc = z_clusters[ci_g_jnp]
                             cpdf_sub = jit_info['jit_fn'](
                                 mn, mx, set_obs, ez, da, dl, rc,
-                                H0_jnp, D_CMB_jnp, gamma_jnp,
+                                H0_jnp, D_CMB_jnp, gamma_jnp, zc,
                                 sub_pref_sr, sub_layer0_sr, sub_layer1_sr,
                                 sub_cov_l0, sub_cov_l1,
                                 sub_apply_cut, sub_cut_val,
@@ -2157,7 +2306,14 @@ class cluster_number_counts:
                     lnM_min, lnM_max, all_obs_vals, all_has_obs,
                     hmf_z_c, skyfracs_clusters,
                     E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
-                    *shared_args, patch_clusters, pre_nd_cpdfs)
+                    H0_jnp, D_CMB_jnp, gamma_jnp, z_clusters,
+                    shared_args[0], shared_args[1], shared_args[2],  # pref_sr, l0_sr, l1_sr
+                    *pc_args,  # per-cluster L0, L1
+                    *shared_args[3:],  # cov, cutoff, lnM bounds
+                    patch_clusters,
+                    obs_vals_1l, has_obs_1l,
+                    pref_sr_1l, l0_sr_1l, l0_pc_1l, cov_1l,
+                    pre_nd_cpdfs)
             else:
                 # Chunked: process bc_chunk clusters at a time
                 log_liks_list = []
@@ -2167,12 +2323,27 @@ class cluster_number_counts:
                     c_end = min(c_start + bc_chunk, n_bc)
                     sl = slice(c_start, c_end)
                     pre_nd_chunk = _compute_all_set_cpdfs(sl)
+                    # Slice per-cluster args
+                    pc_args_sl = tuple(
+                        tuple(p[sl] for p in pc_tuple) for pc_tuple in pc_args)
+                    # Slice 1-layer per-cluster data
+                    obs_1l_sl = obs_vals_1l[:, sl] if n_1l > 0 else obs_vals_1l
+                    has_1l_sl = has_obs_1l[:, sl] if n_1l > 0 else has_obs_1l
+                    l0_pc_1l_sl = tuple(
+                        tuple(p[sl] for p in pc) for pc in l0_pc_1l)
                     ll, cw, lm = self._allinone_bc_jit(
                         lnM_min[sl], lnM_max[sl],
                         all_obs_vals[:, sl], all_has_obs[:, sl],
                         hmf_z_c[sl], skyfracs_clusters[sl],
                         E_z_c[sl], D_A_c[sl], D_l_CMB_c[sl], rho_c_c[sl],
-                        *shared_args, patch_clusters[sl], pre_nd_chunk)
+                        H0_jnp, D_CMB_jnp, gamma_jnp, z_clusters[sl],
+                        shared_args[0], shared_args[1], shared_args[2],
+                        *pc_args_sl,
+                        *shared_args[3:],
+                        patch_clusters[sl],
+                        obs_1l_sl, has_1l_sl,
+                        pref_sr_1l, l0_sr_1l, l0_pc_1l_sl, cov_1l,
+                        pre_nd_chunk)
                     log_liks_list.append(ll)
                     cpdf_list.append(cw)
                     lnM_list.append(lm)
@@ -2507,7 +2678,6 @@ class cluster_number_counts:
         #Stacked_term
 
         if self.cnc_params["stacked_likelihood"] == True:
-
             log_lik = log_lik + self.get_log_lik_stacked()
 
         return log_lik

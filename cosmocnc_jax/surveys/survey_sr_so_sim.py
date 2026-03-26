@@ -25,8 +25,9 @@ def sr_q_so_sim_layer0_deriv(log_theta_500, sigma_sz_polyder, alpha_szifi):
     return alpha_szifi - jnp.polyval(sigma_sz_polyder, log_theta_500) / 3.
 
 
-def sr_q_so_sim_layer1(x0, dof):
-    """Pure JAX: q_so_sim layer 1: log(s/n) -> q = sqrt(exp(x)^2 + dof)."""
+def sr_q_so_sim_layer1(x0, _pref_logy0, _pref_theta, dof):
+    """Pure JAX: q_so_sim layer 1: log(s/n) -> q = sqrt(exp(x)^2 + dof).
+    First 2 args after x0 are prefactors (passed through, unused here)."""
     return jnp.sqrt(jnp.exp(x0)**2 + dof)
 
 
@@ -45,8 +46,9 @@ def sr_p_so_sim_layer0(x0, prefactor_lens, prefactor_M_500_to_theta_lensing,
     return x1
 
 
-def sr_p_so_sim_layer1(x0):
-    """Pure JAX: p_so_sim layer 1: log(kappa/sigma) -> kappa/sigma = exp(x)."""
+def sr_p_so_sim_layer1(x0, _pref_lens, _pref_theta):
+    """Pure JAX: p_so_sim layer 1: log(kappa/sigma) -> kappa/sigma = exp(x).
+    First 2 args after x0 are prefactors (passed through, unused here)."""
     return jnp.exp(x0)
 
 
@@ -519,13 +521,13 @@ class scaling_relations:
         """
         obs = self.observable
         if obs == "q_so_sim":
-            def fn(E_z, D_A, D_l_CMB, rho_c, H0, D_CMB, gamma,
+            def fn(E_z, D_A, D_l_CMB, rho_c, H0, D_CMB, gamma, z_val,
                    A_szifi, bias_sz, alpha_szifi):
                 return precompute_q_prefactors(E_z, H0, D_A,
                                                 A_szifi, bias_sz, alpha_szifi)
             return fn
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
-            def fn(E_z, D_A, D_l_CMB, rho_c, H0, D_CMB, gamma,
+            def fn(E_z, D_A, D_l_CMB, rho_c, H0, D_CMB, gamma, z_val,
                    bias_cmblens):
                 return precompute_p_prefactors(E_z, H0, D_A, D_CMB,
                                                 D_l_CMB, rho_c, gamma,
