@@ -6,12 +6,6 @@ from functools import partial
 from .cnc import *
 from .sr import *
 from .utils import simpson, RegularGridInterpolator
-from .surveys.survey_sr_so_sim import (
-    sr_q_so_sim_layer0, sr_q_so_sim_layer1,
-    sr_p_so_sim_layer0, sr_p_so_sim_layer1,
-    precompute_q_prefactors, precompute_p_prefactors,
-    build_scatter_cov_layer0, build_scatter_cov_layer1,
-)
 import cosmocnc_jax
 
 
@@ -94,163 +88,12 @@ def _sample_2d_jax(key, max_samples, cpdf_lnM, inv_cdf_matrix, u_grid, ln_M):
     return z_samples, lnM_samples
 
 
-@jax.jit
-def _forward_model_qp(key, lnM, E_z, H0, D_A, D_CMB, D_l_CMB, rho_c,
-                       gamma,
-                       A_szifi, bias_sz, alpha_szifi, dof,
-                       bias_cmblens, a_lens,
-                       sigma_sz_poly, sigma_lens_poly,
-                       cov0, cov1):
-    """Forward model for q_so_sim + p_so_sim through 2 layers with scatter.
-
-    All inputs are JAX arrays. Cosmological quantities (E_z, D_A, etc.) are
-    per-cluster arrays of shape (n,).
-
-    Returns:
-        q: (n,) observed q values after layer 1 + noise
-        p: (n,) observed p values after layer 1 + noise
-    """
-    n = lnM.shape[0]
-    key0, key1 = jrandom.split(key)
-
-    # --- Layer 0 ---
-    # q_so_sim prefactors (vectorized over clusters)
-    pref_logy0, pref_theta_q = jax.vmap(
-        precompute_q_prefactors, in_axes=(0, None, 0, None, None, None)
-    )(E_z, H0, D_A, A_szifi, bias_sz, alpha_szifi)
-
-    # q_so_sim layer 0: lnM -> log(y0/sigma)
-    x_q0, _ = sr_q_so_sim_layer0(lnM, pref_logy0, pref_theta_q,
-                                   sigma_sz_poly, alpha_szifi)
-
-    # p_so_sim prefactors (vectorized over clusters)
-    pref_lens, pref_theta_p = jax.vmap(
-        precompute_p_prefactors, in_axes=(0, None, 0, None, 0, 0, None, None)
-    )(E_z, H0, D_A, D_CMB, D_l_CMB, rho_c, gamma, bias_cmblens)
-
-    # p_so_sim layer 0: lnM -> log(kappa/sigma)
-    x_p0 = sr_p_so_sim_layer0(lnM, pref_lens, pref_theta_p,
-                                sigma_lens_poly, a_lens, bias_cmblens)
-
-    # Layer 0 scatter (correlated multivariate normal)
-    n_obs = cov0.shape[0]
-    noise0 = jrandom.multivariate_normal(key0, jnp.zeros(n_obs), cov0, shape=(n,))
-    x_q0 = x_q0 + noise0[:, 0]
-    x_p0 = x_p0 + noise0[:, 1]
-
-    # --- Layer 1 ---
-    q = sr_q_so_sim_layer1(x_q0, dof)
-    p = sr_p_so_sim_layer1(x_p0)
-
-    # Layer 1 noise (measurement noise, identity covariance)
-    noise1 = jrandom.multivariate_normal(key1, jnp.zeros(n_obs), cov1, shape=(n,))
-    q = q + noise1[:, 0]
-    p = p + noise1[:, 1]
-
-    return q, p
-
-
-@jax.jit
-def _forward_model_q_only(key, lnM, E_z, H0, D_A,
-                           A_szifi, bias_sz, alpha_szifi, dof,
-                           sigma_sz_poly,
-                           cov0, cov1):
-    """Forward model for q_so_sim only (single observable) through 2 layers."""
-    n = lnM.shape[0]
-    key0, key1 = jrandom.split(key)
-
-    # Layer 0
-    pref_logy0, pref_theta_q = jax.vmap(
-        precompute_q_prefactors, in_axes=(0, None, 0, None, None, None)
-    )(E_z, H0, D_A, A_szifi, bias_sz, alpha_szifi)
-
-    x_q0, _ = sr_q_so_sim_layer0(lnM, pref_logy0, pref_theta_q,
-                                   sigma_sz_poly, alpha_szifi)
-
-    noise0 = jrandom.multivariate_normal(key0, jnp.zeros(1), cov0, shape=(n,))
-    x_q0 = x_q0 + noise0[:, 0]
-
-    # Layer 1
-    q = sr_q_so_sim_layer1(x_q0, dof)
-    noise1 = jrandom.multivariate_normal(key1, jnp.zeros(1), cov1, shape=(n,))
-    q = q + noise1[:, 0]
-
-    return q
-
-
-@partial(jax.jit, static_argnums=(1,))
-def _generate_catalogue_jit(key, max_clusters,
-                             cpdf_lnM, inv_cdf_matrix, u_grid,
-                             redshift_vec, ln_M,
-                             D_A_vec, E_z_vec, D_l_CMB_vec, rho_c_vec,
-                             H0, D_CMB, gamma,
-                             A_szifi, bias_sz, alpha_szifi, dof,
-                             bias_cmblens, a_lens,
-                             sigma_sz_poly, sigma_lens_poly,
-                             cov0, cov1,
-                             skyfracs, obs_select_min):
-    """Fused JIT: sample from precomputed CDFs, forward model, selection mask.
-
-    Uses a fixed max_clusters buffer (static, compiles once). Caller slices
-    to actual n_clusters before applying the selection mask.
-
-    Args:
-        key: JAX PRNG key
-        max_clusters: buffer size (static — compiles once)
-        cpdf_lnM, inv_cdf_matrix, u_grid: precomputed CDF arrays
-        ...all model parameters...
-
-    Returns:
-        z_samples, lnM_samples, q, p, patches, mask — all shape (max_clusters,)
-    """
-    key_sample, key_patch, key_fwd = jrandom.split(key, 3)
-
-    # 1. Sample (z, lnM) from precomputed CDFs
-    z_samples, lnM_samples = _sample_2d_jax(key_sample, max_clusters,
-                                             cpdf_lnM, inv_cdf_matrix,
-                                             u_grid, ln_M)
-
-    # 2. Assign sky patches via categorical sampling
-    log_probs = jnp.log(skyfracs / jnp.sum(skyfracs))
-    patches = jrandom.categorical(key_patch, log_probs, shape=(max_clusters,))
-
-    # 3. Interpolate cosmological quantities at sampled redshifts
-    D_A = jnp.interp(z_samples, redshift_vec, D_A_vec)
-    E_z = jnp.interp(z_samples, redshift_vec, E_z_vec)
-    D_l_CMB = jnp.interp(z_samples, redshift_vec, D_l_CMB_vec)
-    rho_c = jnp.interp(z_samples, redshift_vec, rho_c_vec)
-
-    # 4. Forward model through scaling relations + scatter
-    q, p = _forward_model_qp(key_fwd, lnM_samples,
-                               E_z, H0, D_A, D_CMB, D_l_CMB, rho_c,
-                               gamma,
-                               A_szifi, bias_sz, alpha_szifi, dof,
-                               bias_cmblens, a_lens,
-                               sigma_sz_poly, sigma_lens_poly,
-                               cov0, cov1)
-
-    # 5. Selection mask
-    mask = q > obs_select_min
-
-    return z_samples, lnM_samples, q, p, patches, mask
-
-
 # =====================================================================
 # Free functions (pure JAX replacements)
 # =====================================================================
 
 def get_samples_pdf_jax(key, n_samples, x, cpdf):
-    """1D inverse CDF sampling using JAX.
-
-    Args:
-        key: JAX PRNG key
-        n_samples: number of samples
-        x: (n,) grid values
-        cpdf: (n,) cumulative PDF (will be normalized)
-
-    Returns:
-        x_samples: (n_samples,) sampled values
-    """
+    """1D inverse CDF sampling using JAX."""
     cpdf_norm = cpdf / jnp.max(cpdf)
     u = jrandom.uniform(key, (n_samples,))
     x_samples = jnp.interp(u, cpdf_norm, x)
@@ -258,62 +101,62 @@ def get_samples_pdf_jax(key, n_samples, x, cpdf):
 
 
 def get_samples_pdf_2d_jax(key, n_samples, x, y, pdf):
-    """2D inverse CDF sampling using JAX.
-
-    Samples from a 2D PDF on a regular grid using marginal + conditional CDFs.
-
-    Args:
-        key: JAX PRNG key
-        n_samples: number of samples
-        x: (n_x,) first coordinate grid (e.g., redshift)
-        y: (n_y,) second coordinate grid (e.g., lnM)
-        pdf: (n_x, n_y) probability density on the grid
-
-    Returns:
-        (x_samples, y_samples): tuple of (n_samples,) arrays
-    """
+    """2D inverse CDF sampling using JAX with logit-space interpolation."""
     key1, key2 = jrandom.split(key)
 
-    # Build conditional CDF(x|y) — cumsum along axis 0 (x axis)
+    eps = 1e-12
+
     cpdf_xgy = jnp.cumsum(pdf, axis=0) * (x[1] - x[0])
-    # Normalize each column
     col_max = jnp.max(cpdf_xgy, axis=0, keepdims=True)
     cpdf_xgy = cpdf_xgy / jnp.where(col_max > 0., col_max, 1.)
 
-    # Marginal CDF of y
     cpdf_y = jnp.cumsum(jnp.sum(pdf, axis=0)) * (y[1] - y[0]) * (x[1] - x[0])
 
-    # Sample y from marginal
     y_samples = get_samples_pdf_jax(key1, n_samples, y, cpdf_y)
 
-    # Build inverse CDF matrix for x|y
-    u_grid = jnp.linspace(0., 1., len(x))
+    # Build logit-space grid for interpolation
+    wmin = jnp.log(eps) - jnp.log1p(-eps)
+    wmax = jnp.log(1.0 - eps) - jnp.log1p(-(1.0 - eps))
+    w = jnp.linspace(wmin, wmax, len(x))
+    w_norm = (w - wmin) / (wmax - wmin)
 
+    # Map x to logit space
+    xmin, xmax = jnp.min(x), jnp.max(x)
+    x_unit = jnp.clip((x - xmin) / (xmax - xmin), eps, 1.0 - eps)
+    x_logit = jnp.log(x_unit) - jnp.log1p(-x_unit)
+
+    # Invert each conditional CDF column in logit-logit space
     def _invert_column(cpdf_col):
-        return jnp.interp(u_grid, cpdf_col, x)
+        u_col = jnp.clip(cpdf_col, eps, 1.0 - eps)
+        w_col = jnp.log(u_col) - jnp.log1p(-u_col)
+        return jnp.interp(w, w_col, x_logit)
 
-    x_matrix = jax.vmap(_invert_column)(cpdf_xgy.T).T  # (n_x, n_y)
+    x_matrix = jax.vmap(_invert_column)(cpdf_xgy.T).T
 
-    # Sample x from conditional via 2D interpolation
+    # Sample and transform to logit space
     u_x = jrandom.uniform(key2, (n_samples,))
-    interp = RegularGridInterpolator((u_grid, y), x_matrix,
-                                      method='linear', bounds_error=False)
-    points = jnp.stack([u_x, y_samples], axis=-1)
-    x_samples = interp(points)
+    u_x = jnp.clip(u_x, eps, 1.0 - eps)
+    w_x = jnp.log(u_x) - jnp.log1p(-u_x)
+    w_x_norm = (w_x - wmin) / (wmax - wmin)
+
+    interp = RegularGridInterpolator((w_norm, y), x_matrix,
+                                      method='linear', bounds_error=False,
+                                      fill_value=x_logit[0])
+    points = jnp.stack([w_x_norm, y_samples], axis=-1)
+    x_logit_samp = interp(points)
+
+    # Map back from logit space
+    lo = jnp.log(eps) - jnp.log1p(-eps)
+    hi = jnp.log(1.0 - eps) - jnp.log1p(-(1.0 - eps))
+    x_logit_samp = jnp.clip(x_logit_samp, lo, hi)
+    x_unit_samp = 1.0 / (1.0 + jnp.exp(-x_logit_samp))
+    x_samples = xmin + x_unit_samp * (xmax - xmin)
 
     return (x_samples, y_samples)
 
 
 def sample_lonlat_jax(key, n_clusters):
-    """Sample uniform longitude and latitude on the sphere using JAX.
-
-    Args:
-        key: JAX PRNG key
-        n_clusters: number of samples
-
-    Returns:
-        (lon, lat): tuple of (n_clusters,) arrays in radians
-    """
+    """Sample uniform longitude and latitude on the sphere using JAX."""
     key1, key2 = jrandom.split(key)
     lon = 2. * jnp.pi * jrandom.uniform(key1, (n_clusters,))
     lat = jnp.arccos(2. * jrandom.uniform(key2, (n_clusters,)) - 1.)
@@ -374,32 +217,17 @@ class catalogue_generator:
         if self.sky_frac is None:
             self.sky_frac = np.sum(self.skyfracs)
 
+        print("Sky frac", self.sky_frac)
+
         self.hmf_matrix = self.number_counts.hmf_matrix * 4. * jnp.pi * self.sky_frac
-        # Keep as JAX arrays to avoid repeated CPU→GPU transfers in JIT calls
         self.ln_M = jnp.asarray(self.number_counts.ln_M)
         self.redshift_vec = jnp.asarray(self.number_counts.redshift_vec)
 
-        # Cache constant arrays for JIT path
+        # Cache constant cosmological arrays
         self._cache_cosmo_arrays()
-        self._cache_sr_arrays()
 
-        # Precompute n_tot and max_clusters buffer (avoids redundant simpson calls)
+        # Precompute n_tot
         self._compute_n_tot()
-
-        # Fixed max_clusters buffer for JIT (set once, avoids recompilation)
-        self._max_clusters = max(int(self.n_tot * 2), 1000)
-
-        # Determine once whether we can use the JIT path
-        observables = self.params_cnc["observables"][0]
-        vec = self.params_cnc["observable_vectorised"]
-        is_vectorised = (isinstance(vec, bool) and vec) or \
-                        (isinstance(vec, dict) and all(vec.get(obs, True) for obs in observables))
-        cov_const_all = all(self.params_cnc["cov_constant"].get(str(i), True) is True
-                            for i in range(2))
-        self._use_jit = (is_vectorised and cov_const_all and
-                         self.patches_from_coord == False and
-                         self._obs_config in ("qp", "q") and
-                         self.get_sky_coords == False)
 
     def _compute_n_tot(self):
         """Compute n_tot from HMF matrix. Also sets dndz and dndln_M."""
@@ -408,19 +236,11 @@ class catalogue_generator:
         self.n_tot = simpson(self.dndz, x=self.redshift_vec)
 
     def update_hmf(self):
-        """Update HMF matrix and derived quantities after cosmology change.
-
-        Call this instead of creating a new catalogue_generator when only the
-        cosmology (and thus HMF) has changed. Avoids __init__ overhead.
-        """
+        """Update HMF matrix and derived quantities after cosmology change."""
         self.number_counts.get_hmf()
         self.hmf_matrix = self.number_counts.hmf_matrix * 4. * jnp.pi * self.sky_frac
         self._cache_cosmo_arrays()
         self._compute_n_tot()
-        # Grow max_clusters if new n_tot requires it (never shrink — avoids recompile)
-        new_max = max(int(self.n_tot * 2), 1000)
-        if new_max > self._max_clusters:
-            self._max_clusters = new_max
 
     def _next_key(self):
         """Split and advance the PRNG key."""
@@ -428,79 +248,20 @@ class catalogue_generator:
         return subkey
 
     def _cache_cosmo_arrays(self):
-        """Cache cosmological arrays from number_counts for JIT functions."""
+        """Cache cosmological arrays from number_counts."""
         nc = self.number_counts
         self._D_A_vec = jnp.asarray(nc.D_A)
         self._E_z_vec = jnp.asarray(nc.E_z)
         self._D_l_CMB_vec = jnp.asarray(nc.D_l_CMB)
         self._rho_c_vec = jnp.asarray(nc.rho_c)
-        self._H0 = jnp.float64(nc.cosmology.cosmo_params["h"] * 100.)
-        self._D_CMB = jnp.float64(nc.cosmology.D_CMB)
-        self._gamma = jnp.float64(cosmocnc_jax.constants().gamma)
-
-    def _cache_sr_arrays(self):
-        """Cache scaling relation arrays for JIT functions."""
-        sr_params = self.number_counts.scal_rel_params
-        obs_select = self.params_cnc["obs_select"]
-        observables = self.params_cnc["observables"][0]
-
-        # Determine observable configuration
-        has_q = "q_so_sim" in observables
-        has_p = "p_so_sim" in observables
-        self._has_q = has_q
-        self._has_p = has_p
-
-        if has_q and has_p:
-            self._obs_config = "qp"
-        elif has_q:
-            self._obs_config = "q"
-        elif has_p:
-            self._obs_config = "p"
-        else:
-            self._obs_config = None
-
-        # SR scalar parameters
-        self._A_szifi = jnp.float64(sr_params.get("A_szifi", 0.))
-        self._bias_sz = jnp.float64(sr_params.get("bias_sz", 1.))
-        self._alpha_szifi = jnp.float64(sr_params.get("alpha_szifi", 1.))
-        self._dof = jnp.float64(sr_params.get("dof", 0.))
-        self._bias_cmblens = jnp.float64(sr_params.get("bias_cmblens", 1.))
-        self._a_lens = jnp.float64(sr_params.get("a_lens", 1.))
-
-        # Polynomial coefficients
-        if has_q:
-            self._sigma_sz_poly = self.scaling_relations["q_so_sim"].sigma_sz_poly
-        else:
-            self._sigma_sz_poly = jnp.zeros(4)
-
-        if has_p:
-            self._sigma_lens_poly = self.scaling_relations["p_so_sim"].sigma_lens_poly
-        else:
-            self._sigma_lens_poly = jnp.zeros(4)
-
-        # Scatter covariance matrices
-        sigma_lnq = jnp.float64(sr_params.get("sigma_lnq_szifi", 0.))
-        sigma_lnp = jnp.float64(sr_params.get("sigma_lnp", 0.))
-        corr = jnp.float64(sr_params.get("corr_lnq_lnp", 0.))
-
-        if self._obs_config is not None:
-            self._cov0 = build_scatter_cov_layer0(sigma_lnq, sigma_lnp, corr,
-                                                   self._obs_config)
-            self._cov1 = build_scatter_cov_layer1(self._obs_config)
-        else:
-            self._cov0 = jnp.zeros((1, 1))
-            self._cov1 = jnp.zeros((1, 1))
-
-        # Skyfracs as JAX array
-        self._skyfracs_jax = jnp.asarray(self.skyfracs, dtype=jnp.float64)
-
-        # Selection threshold
-        self._obs_select_min = jnp.float64(self.params_cnc["obs_select_min"])
+        self._H0 = nc.cosmology.cosmo_params["h"] * 100.
+        self._D_CMB = nc.cosmology.D_CMB
+        self._gamma = cosmocnc_jax.constants().gamma
 
     def get_total_number_clusters(self):
-        # n_tot already computed in __init__; recompute only if HMF changed
         if not hasattr(self, 'n_tot'):
             self._compute_n_tot()
+        print("Total mean number of clusters", self.n_tot)
 
     def sample_total_number_clusters(self):
 
@@ -509,10 +270,11 @@ class catalogue_generator:
                                                     shape=(self.n_catalogues,)))
 
     def get_sky_patches_multinomial(self):
-        """Assign sky patches using categorical sampling (JAX replacement for multinomial)."""
+        """Assign sky patches using categorical sampling."""
 
         self.sky_patches = {}
-        log_probs = jnp.log(self._skyfracs_jax / jnp.sum(self._skyfracs_jax))
+        skyfracs_jax = jnp.asarray(self.skyfracs, dtype=jnp.float64)
+        log_probs = jnp.log(skyfracs_jax / jnp.sum(skyfracs_jax))
 
         for i in range(0, self.n_catalogues):
 
@@ -593,117 +355,19 @@ class catalogue_generator:
         self.get_total_number_clusters()
         self.sample_total_number_clusters()
 
+        if self.patches_from_coord == False:
+            self.get_sky_patches_multinomial()
+
         self.catalogue_list = []
 
-        if self._use_jit:
-            # Rebuild CDFs only if HMF changed (tracked by _hmf_id)
-            hmf_id = id(self.hmf_matrix)
-            if not hasattr(self, '_hmf_id') or self._hmf_id != hmf_id:
-                self._cpdf_lnM, self._inv_cdf_matrix, self._u_grid = _build_cdfs(
-                    self.redshift_vec, self.ln_M, self.hmf_matrix)
-                self._hmf_id = hmf_id
+        for ii in range(0, self.n_catalogues):
 
-            # Ensure max_clusters covers all Poisson draws
-            max_needed = int(np.max(self.n_tot_obs))
-            if max_needed > self._max_clusters:
-                self._max_clusters = max_needed
+            n_clusters = int(self.n_tot_obs[ii])
+            catalogue = self._generate_catalogue(ii, n_clusters)
+            self.catalogue_list.append(catalogue)
 
-            for ii in range(self.n_catalogues):
-                n_clusters = int(self.n_tot_obs[ii])
-                if self._obs_config == "qp":
-                    catalogue = self._generate_catalogue_jit_qp(ii, n_clusters)
-                else:
-                    catalogue = self._generate_catalogue_jit_q_only(ii, n_clusters)
-                self.catalogue_list.append(catalogue)
-
-        else:
-            # Fallback path: needs sky patches computed upfront
-            if self.patches_from_coord == False:
-                self.get_sky_patches_multinomial()
-
-            for ii in range(self.n_catalogues):
-                n_clusters = int(self.n_tot_obs[ii])
-                catalogue = self._generate_catalogue_fallback(ii, n_clusters)
-                self.catalogue_list.append(catalogue)
-
-    def _generate_catalogue_jit_qp(self, cat_idx, n_clusters):
-        """Fast JIT path for q+p SO sim with constant covariance."""
-
-        key = self._next_key()
-
-        z_all, lnM_all, q_all, p_all, patches_all, mask_all = _generate_catalogue_jit(
-            key, self._max_clusters,
-            self._cpdf_lnM, self._inv_cdf_matrix, self._u_grid,
-            self.redshift_vec, self.ln_M,
-            self._D_A_vec, self._E_z_vec, self._D_l_CMB_vec, self._rho_c_vec,
-            self._H0, self._D_CMB, self._gamma,
-            self._A_szifi, self._bias_sz, self._alpha_szifi, self._dof,
-            self._bias_cmblens, self._a_lens,
-            self._sigma_sz_poly, self._sigma_lens_poly,
-            self._cov0, self._cov1,
-            self._skyfracs_jax, self._obs_select_min)
-
-        # Wait for GPU, then transfer to CPU + numpy boolean mask
-        jax.block_until_ready(z_all)
-        z = np.asarray(z_all[:n_clusters])
-        lnM = np.asarray(lnM_all[:n_clusters])
-        q = np.asarray(q_all[:n_clusters])
-        p = np.asarray(p_all[:n_clusters])
-        patches = np.asarray(patches_all[:n_clusters])
-        mask = np.asarray(mask_all[:n_clusters])
-
-        catalogue = {}
-        catalogue["z"] = z[mask]
-        catalogue["M"] = np.exp(lnM[mask])
-        catalogue["q_so_sim"] = q[mask]
-        catalogue["p_so_sim"] = p[mask]
-        catalogue["q_so_sim_patch"] = patches[mask]
-        catalogue["p_so_sim_patch"] = patches[mask]
-
-        return catalogue
-
-    def _generate_catalogue_jit_q_only(self, cat_idx, n_clusters):
-        """Fast JIT path for q_so_sim only with constant covariance."""
-
-        key = self._next_key()
-        key_sample, key_patch, key_fwd = jrandom.split(key, 3)
-
-        # Sample from precomputed CDFs using fixed max_clusters buffer
-        z_all, lnM_all = _sample_2d_jax(
-            key_sample, self._max_clusters,
-            self._cpdf_lnM, self._inv_cdf_matrix, self._u_grid, self.ln_M)
-
-        # Patches
-        log_probs = jnp.log(self._skyfracs_jax / jnp.sum(self._skyfracs_jax))
-        patches_all = jrandom.categorical(key_patch, log_probs, shape=(self._max_clusters,))
-
-        # Interpolate cosmo at z_samples
-        E_z = jnp.interp(z_all, self.redshift_vec, self._E_z_vec)
-        D_A = jnp.interp(z_all, self.redshift_vec, self._D_A_vec)
-
-        # Forward model
-        q_all = _forward_model_q_only(
-            key_fwd, lnM_all, E_z, self._H0, D_A,
-            self._A_szifi, self._bias_sz, self._alpha_szifi, self._dof,
-            self._sigma_sz_poly, self._cov0, self._cov1)
-
-        # Transfer to CPU in one batch, then boolean mask with numpy
-        z = np.asarray(z_all[:n_clusters])
-        lnM = np.asarray(lnM_all[:n_clusters])
-        q = np.asarray(q_all[:n_clusters])
-        patches = np.asarray(patches_all[:n_clusters])
-        mask = q > float(self._obs_select_min)
-
-        catalogue = {}
-        catalogue["z"] = z[mask]
-        catalogue["M"] = np.exp(lnM[mask])
-        catalogue["q_so_sim"] = q[mask]
-        catalogue["q_so_sim_patch"] = patches[mask]
-
-        return catalogue
-
-    def _generate_catalogue_fallback(self, ii, n_clusters):
-        """Fallback path preserving all original functionality."""
+    def _generate_catalogue(self, ii, n_clusters):
+        """Generate a single catalogue with generic observables."""
 
         catalogue = {}
         key_sample = self._next_key()
