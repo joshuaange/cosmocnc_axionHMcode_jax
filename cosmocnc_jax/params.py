@@ -73,6 +73,7 @@ cnc_params_default = {
     "M_min": 5e13,
     "M_max": 5e15,
     "M_min_extended": None,
+    "M_min_cutoff": None,
     "hmf_calc": "cnc", # "cnc" (JAX, required for classy_sz_jax), "hmf", "MiraTitan"
     "hmf_type": "Tinker08",
     "mass_definition": "500c",

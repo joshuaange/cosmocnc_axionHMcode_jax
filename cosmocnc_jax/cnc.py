@@ -1948,6 +1948,32 @@ class cluster_number_counts:
                         pat: np.array(idxs, dtype=int) for pat, idxs in groups.items()
                     }
 
+                # Pre-stack obs arrays (immutable across MCMC steps)
+                _all_obs_vals = jnp.stack([obs_data[o][0] for o in self._bc_obs_list])
+                _all_has_obs = jnp.stack([obs_data[o][1] for o in self._bc_obs_list])
+
+                # Pre-build 1-layer observable arrays (immutable)
+                n_1l = len(self._1layer_obs_list)
+                if n_1l > 0:
+                    _obs_vals_1l = jnp.stack([
+                        jnp.asarray(self.catalogue.catalogue[o])[idx_bc]
+                        for o in self._1layer_obs_list])
+                    _has_obs_1l = jnp.stack([
+                        ~jnp.isnan(jnp.asarray(self.catalogue.catalogue[o])[idx_bc])
+                        for o in self._1layer_obs_list])
+                else:
+                    _obs_vals_1l = jnp.zeros((1, n_bc))
+                    _has_obs_1l = jnp.zeros((1, n_bc), dtype=jnp.bool_)
+
+                # Pre-build pattern-loop index mappings:
+                # for each (s_idx, pattern), store the obs indices into _bc_obs_list
+                _pattern_obs_indices = {}
+                for s_idx, obs_names_s in enumerate(self._bc_set_obs):
+                    for pattern in pattern_groups.get(s_idx, {}):
+                        sub_obs = [obs_names_s[k] for k in pattern]
+                        _pattern_obs_indices[(s_idx, pattern)] = [
+                            self._bc_obs_list.index(o) for o in sub_obs]
+
                 self._bc_cached = {
                     'idx_bc': idx_bc,
                     'z_clusters': z_clusters,
@@ -1955,6 +1981,11 @@ class cluster_number_counts:
                     'skyfracs_clusters': skyfracs_clusters,
                     'patch_clusters': patch_clusters,
                     'pattern_groups': pattern_groups,
+                    'all_obs_vals': _all_obs_vals,
+                    'all_has_obs': _all_has_obs,
+                    'obs_vals_1l': _obs_vals_1l,
+                    'has_obs_1l': _has_obs_1l,
+                    'pattern_obs_indices': _pattern_obs_indices,
                 }
             else:
                 idx_bc = self._bc_cached['idx_bc']
@@ -2027,37 +2058,58 @@ class cluster_number_counts:
                 patch_clusters)
 
             # ── Stage 3: All-in-one backward conv + combine + integrate (single JIT) ──
-            # Prepare stacked obs/has_obs arrays: (n_obs, n_clusters)
-            all_obs_vals = jnp.stack([obs_data[o][0] for o in self._bc_obs_list])
-            all_has_obs = jnp.stack([obs_data[o][1] for o in self._bc_obs_list])
+            # Use pre-stacked obs arrays (immutable, cached)
+            all_obs_vals = self._bc_cached['all_obs_vals']
+            all_has_obs = self._bc_cached['all_has_obs']
 
             # Per-observable SR params tiled to (n_patches, ...) for patch indexing
+            # Reuse mass-range results for the selection observable to avoid redundant SR calls
+            _sel_idx = self._bc_obs_list.index(obs_select_key) if obs_select_key in self._bc_obs_list else -1
             all_pref_sr = tuple(
+                ref_pref_sr if i == _sel_idx else
                 _tile_to_patches(self.scaling_relations[o].get_prefactor_sr_params(self.scal_rel_params), n_p)
-                for o in self._bc_obs_list)
+                for i, o in enumerate(self._bc_obs_list))
             all_layer0_sr = tuple(
+                ref_layer0_sr if i == _sel_idx else
                 _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(0, self.scal_rel_params), n_p)
-                for o in self._bc_obs_list)
+                for i, o in enumerate(self._bc_obs_list))
             all_layer1_sr = tuple(
+                ref_layer1_sr if i == _sel_idx else
                 _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(1, self.scal_rel_params), n_p)
-                for o in self._bc_obs_list)
+                for i, o in enumerate(self._bc_obs_list))
 
             # Per-cluster SR params (vmapped over cluster axis, NOT tiled to patches)
             # These are (n_cat, ...) arrays sliced to bc clusters via idx_bc.
+            # Uses identity-based caching: only re-slices arrays whose object identity
+            # changed (e.g. beta_avg after update_beta_avg). Static arrays (shear radii,
+            # tomo weights, etc.) are sliced once and reused.
             def _get_pc(o, k):
                 sr = self.scaling_relations[o]
                 if hasattr(sr, 'get_layer_sr_params_per_cluster'):
                     return sr.get_layer_sr_params_per_cluster(k, self.scal_rel_params)
                 return ()
-            n_cat = len(self.catalogue.catalogue["z"])
-            all_layer0_sr_pc = tuple(
-                tuple(jnp.asarray(p)[idx_bc] for p in _get_pc(o, 0))
-                for o in self._bc_obs_list)
-            all_layer1_sr_pc = tuple(
-                tuple(jnp.asarray(p)[idx_bc] for p in _get_pc(o, 1))
-                for o in self._bc_obs_list)
+
+            if not hasattr(self, '_pc_slice_cache'):
+                self._pc_slice_cache = {}
+
+            def _get_pc_sliced(o, k):
+                raw = _get_pc(o, k)
+                if len(raw) == 0:
+                    return ()
+                cache_key = (o, k)
+                cached = self._pc_slice_cache.get(cache_key)
+                if cached is not None and len(cached[0]) == len(raw) and all(
+                        p is cp for p, cp in zip(raw, cached[0])):
+                    return cached[1]
+                sliced = tuple(jnp.asarray(p)[idx_bc] for p in raw)
+                self._pc_slice_cache[cache_key] = (raw, sliced)
+                return sliced
+
+            all_layer0_sr_pc = tuple(_get_pc_sliced(o, 0) for o in self._bc_obs_list)
+            all_layer1_sr_pc = tuple(_get_pc_sliced(o, 1) for o in self._bc_obs_list)
 
             # Per-correlation-set: covariance matrices, cutoff config
+            # Build cov in numpy then convert once (avoids N² jnp.at[].set() dispatches)
             all_cov_layer0 = []
             all_cov_layer1 = []
             all_apply_cut_sets = []
@@ -2065,21 +2117,16 @@ class cluster_number_counts:
 
             for obs_names in self._bc_set_obs:
                 n_obs_s = len(obs_names)
-                # Build covariance matrices for this set
-                cov_l0 = jnp.zeros((n_obs_s, n_obs_s))
-                cov_l1 = jnp.zeros((n_obs_s, n_obs_s))
-                for i in range(n_obs_s):
-                    for j in range(n_obs_s):
-                        cov_l0 = cov_l0.at[i, j].set(
-                            self.scatter.get_cov(
-                                observable1=obs_names[i], observable2=obs_names[j],
-                                layer=0, patch1=0, patch2=0))
-                        cov_l1 = cov_l1.at[i, j].set(
-                            self.scatter.get_cov(
-                                observable1=obs_names[i], observable2=obs_names[j],
-                                layer=1, patch1=0, patch2=0))
-                all_cov_layer0.append(cov_l0)
-                all_cov_layer1.append(cov_l1)
+                cov_l0_np = np.array([[
+                    self.scatter.get_cov(observable1=obs_names[i], observable2=obs_names[j],
+                                         layer=0, patch1=0, patch2=0)
+                    for j in range(n_obs_s)] for i in range(n_obs_s)])
+                cov_l1_np = np.array([[
+                    self.scatter.get_cov(observable1=obs_names[i], observable2=obs_names[j],
+                                         layer=1, patch1=0, patch2=0)
+                    for j in range(n_obs_s)] for i in range(n_obs_s)])
+                all_cov_layer0.append(jnp.asarray(cov_l0_np))
+                all_cov_layer1.append(jnp.asarray(cov_l1_np))
 
                 # Cutoff: applied if selection observable is in this set
                 set_has_cutoff = obs_select_key in obs_names
@@ -2103,15 +2150,11 @@ class cluster_number_counts:
             # Per-cluster args (vmapped on axis 0)
             pc_args = (all_layer0_sr_pc, all_layer1_sr_pc)
 
-            # 1-layer observable data
+            # 1-layer observable data (obs/has arrays are cached, SR params rebuilt)
             n_1l = len(self._1layer_obs_list)
+            obs_vals_1l = self._bc_cached['obs_vals_1l']
+            has_obs_1l = self._bc_cached['has_obs_1l']
             if n_1l > 0:
-                obs_vals_1l = jnp.stack([
-                    jnp.asarray(self.catalogue.catalogue[o])[idx_bc]
-                    for o in self._1layer_obs_list])  # (n_1l, n_bc)
-                has_obs_1l = jnp.stack([
-                    ~jnp.isnan(jnp.asarray(self.catalogue.catalogue[o])[idx_bc])
-                    for o in self._1layer_obs_list])  # (n_1l, n_bc)
                 pref_sr_1l = tuple(
                     _tile_to_patches(self.scaling_relations[o].get_prefactor_sr_params(
                         self.scal_rel_params), n_p)
@@ -2120,17 +2163,12 @@ class cluster_number_counts:
                     _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(
                         0, self.scal_rel_params), n_p)
                     for o in self._1layer_obs_list)
-                l0_pc_1l = tuple(
-                    tuple(jnp.asarray(p)[idx_bc] for p in _get_pc(o, 0))
-                    for o in self._1layer_obs_list)
+                l0_pc_1l = tuple(_get_pc_sliced(o, 0) for o in self._1layer_obs_list)
                 cov_1l = tuple(
                     jnp.float64(self.scatter.get_cov(
                         observable1=o, observable2=o, layer=0, patch1=0, patch2=0))
                     for o in self._1layer_obs_list)
             else:
-                # Dummy (1, n_bc) arrays — loop runs 0 times so never accessed
-                obs_vals_1l = jnp.zeros((1, len(idx_bc)))
-                has_obs_1l = jnp.zeros((1, len(idx_bc)), dtype=jnp.bool_)
                 pref_sr_1l = ()
                 l0_sr_1l = ()
                 l0_pc_1l = ()
@@ -2225,22 +2263,14 @@ class cluster_number_counts:
                         dl = D_l_CMB_c[ci_g_jnp]
                         rc = rho_c_c[ci_g_jnp]
 
-                        # Sub-pattern observable names
-                        sub_obs = [obs_names_s[k] for k in pattern]
+                        # Use cached obs-index mapping instead of rebuilding SR params
+                        obs_idxs = self._bc_cached['pattern_obs_indices'][(s_idx, pattern)]
+                        sub_obs = [self._bc_obs_list[i] for i in obs_idxs]
 
-                        # SR params for sub-pattern (tiled to n_patches)
-                        sub_pref_sr = tuple(
-                            _tile_to_patches(self.scaling_relations[o].get_prefactor_sr_params(
-                                self.scal_rel_params), n_p)
-                            for o in sub_obs)
-                        sub_layer0_sr = tuple(
-                            _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(
-                                0, self.scal_rel_params), n_p)
-                            for o in sub_obs)
-                        sub_layer1_sr = tuple(
-                            _tile_to_patches(self.scaling_relations[o].get_layer_sr_params(
-                                1, self.scal_rel_params), n_p)
-                            for o in sub_obs)
+                        # Index into already-computed SR params (no redundant SR calls)
+                        sub_pref_sr = tuple(all_pref_sr[i] for i in obs_idxs)
+                        sub_layer0_sr = tuple(all_layer0_sr[i] for i in obs_idxs)
+                        sub_layer1_sr = tuple(all_layer1_sr[i] for i in obs_idxs)
 
                         # Per-cluster patch indices for this group
                         patch_sub = patch_clusters[ci_g_jnp]
@@ -2266,15 +2296,13 @@ class cluster_number_counts:
                                 [obs_data[sub_obs[j]][0][ci_g_jnp]
                                  for j in range(2)], axis=1)
                             zc = z_clusters[ci_g_jnp]
-                            # Per-cluster data for this group
+                            # Per-cluster data: index into already-computed arrays
                             sub_l0_pc = tuple(
-                                tuple(p[ci_g_jnp] for p in all_layer0_sr_pc[
-                                    self._bc_obs_list.index(o)])
-                                for o in sub_obs)
+                                tuple(p[ci_g_jnp] for p in all_layer0_sr_pc[i])
+                                for i in obs_idxs)
                             sub_l1_pc = tuple(
-                                tuple(p[ci_g_jnp] for p in all_layer1_sr_pc[
-                                    self._bc_obs_list.index(o)])
-                                for o in sub_obs)
+                                tuple(p[ci_g_jnp] for p in all_layer1_sr_pc[i])
+                                for i in obs_idxs)
                             cpdf_sub = _dispatch_2d_split(
                                 jit_info['fwd_jit'], jit_info['conv_jit'],
                                 mn, mx, set_obs, ez, da, dl, rc, zc,
@@ -2331,9 +2359,9 @@ class cluster_number_counts:
                     # Slice per-cluster args
                     pc_args_sl = tuple(
                         tuple(p[sl] for p in pc_tuple) for pc_tuple in pc_args)
-                    # Slice 1-layer per-cluster data
-                    obs_1l_sl = obs_vals_1l[:, sl] if n_1l > 0 else obs_vals_1l
-                    has_1l_sl = has_obs_1l[:, sl] if n_1l > 0 else has_obs_1l
+                    # Slice 1-layer per-cluster data (always slice, even dummy arrays)
+                    obs_1l_sl = obs_vals_1l[:, sl]
+                    has_1l_sl = has_obs_1l[:, sl]
                     l0_pc_1l_sl = tuple(
                         tuple(p[sl] for p in pc) for pc in l0_pc_1l)
                     ll, cw, lm = self._allinone_bc_jit(
