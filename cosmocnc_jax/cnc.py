@@ -1488,6 +1488,11 @@ class cluster_number_counts:
             self.D_l_CMB = jnp.asarray(self.cosmology.background_cosmology.angular_diameter_distance_z1z2(np.asarray(self.redshift_vec),self.cosmology.z_CMB).value)
             self.rho_c = jnp.asarray(self.cosmology.background_cosmology.critical_density(np.asarray(self.redshift_vec)).value*1000.*self.const.mpc**3/self.const.solar)
 
+        # Update cosmology-dependent per-cluster quantities (e.g., beta_avg for WL)
+        for sr in self.scaling_relations.values():
+            if hasattr(sr, 'update_beta_avg'):
+                sr.update_beta_avg(D_A=self.D_A, redshift_vec=self.redshift_vec)
+
         #Evaluate the halo mass function
 
         self.halo_mass_function = halo_mass_function(cosmology=self.cosmology,hmf_type=self.cnc_params["hmf_type"],
