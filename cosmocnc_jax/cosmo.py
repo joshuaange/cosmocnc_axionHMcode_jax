@@ -328,20 +328,20 @@ class cosmology_model:
         # D_CMB = da_rec = ra_rec / (1 + z_rec) = angular diameter distance at recombination
         self.D_CMB = float(der[8]) / (1. + self.z_CMB)
 
-        # T_CMB and neutrinos (constant, from classy — only needed at init)
         if not hasattr(self, 'T_CMB_0'):
             self.T_CMB_0 = self.classy.T_cmb()
-        if not hasattr(self, 'Omega_nu'):
-            self.Omega_nu = self.classy.Omega_nu
-        self.cosmo_params["Onu0"] = self.Omega_nu
 
-        # Precompute Omega components for Delta conversion (matching get_all_relevant_params)
+        # Precompute Omega components for Delta conversion (matching get_all_relevant_params).
+        # Omega_nu is not cached: m_nu and h can change per MCMC step, and the
+        # hmfast branch follows the same convention.
         h = self.cosmo_params["h"]
         Ob = self._pvd['omega_b'] / h**2
         Ocdm = self._pvd['omega_cdm'] / h**2
         m_ncdm = self._pvd.get('m_ncdm', 0.06)
         deg_ncdm = 1  # lcdm default
         Oncdm = deg_ncdm * m_ncdm / (93.14 * h**2)
+        self.Omega_nu = float(Oncdm)
+        self.cosmo_params["Onu0"] = self.Omega_nu
         self._Om0 = Ocdm + Ob + Oncdm
         self._Om0_nonu = self._Om0 - Oncdm
         # Radiation: Omega_gamma from Stefan-Boltzmann
