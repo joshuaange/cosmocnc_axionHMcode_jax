@@ -20,3 +20,8 @@ Thumbs.db
 
 # Test outputs
 tests/*.png
+tests/plots/*.pkl
+tests/plots/*.png
+tests/plots/*.pdf
+*.log
+.claude/settings.local.json
