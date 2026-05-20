@@ -283,7 +283,7 @@ class cosmology_model:
             self._build_params_values_dict()
             self._init_hmfast_cosmology()
 
-        print("cosmo params",self.cosmo_params)
+        #print("cosmo params",self.cosmo_params)
 
 
     def _build_params_values_dict(self):

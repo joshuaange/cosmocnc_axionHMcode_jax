@@ -1438,6 +1438,25 @@ class cluster_number_counts:
 
     def get_hmf(self,volume_element=True):
 
+        if self.cnc_params["hmf_type"] == "ST_axionHMcode":
+            if "G_a_precomputed" in self.cosmo_params:
+                self.cosmology.G_a_cached          = self.cosmo_params["G_a_precomputed"]
+                self.cosmology.D_grid_z_full       = self.cosmo_params["D_grid_z_precomputed"]
+                self.cosmology.D_grid_full         = self.cosmo_params["D_grid_precomputed"]
+                self.cosmology.normalisation_cached = self.cosmo_params["normalisation_precomputed"]
+            else:
+                # fallback: recompute (slow)
+                Om0 = self.cosmo_params["Om0"]
+                h   = self.cosmology.background_cosmology.H0.value / 100.
+                E_z = lambda z: self.cosmology.background_cosmology.H(z).value / (100. * h)
+                self.cosmology.G_a_cached           = func_axionHMcode_D_z_unnorm_int(0., Om0, E_z)
+                self.cosmology.normalisation_cached  = func_axionHMcode_D_z_unnorm(0., Om0, E_z)
+                self.cosmology.D_grid_z_full        = np.concatenate([
+                    np.linspace(1e-6, 1., 1000), np.linspace(1., 100., 1000)])
+                self.cosmology.D_grid_full          = np.array([
+                    func_axionHMcode_D_z_unnorm(z, Om0, E_z) / self.cosmology.normalisation_cached
+                    for z in self.cosmology.D_grid_z_full])
+
         self.const = constants()
 
         #Define redshift and observable ranges
@@ -2575,7 +2594,7 @@ class cluster_number_counts:
         self.n_obs = jnp.sum(self.n_obs_matrix,axis=0)
         self.n_tot = jnp.sum(self.n_tot_vec)
 
-        self.logger.info("Total clusters: %.5f",self.n_tot)
+        #self.logger.info("Total clusters: %.5f",self.n_tot)
 
         if self.cnc_params["non_validated_clusters"] == True:
 
