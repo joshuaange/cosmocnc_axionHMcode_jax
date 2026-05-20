@@ -1636,14 +1636,14 @@ class cluster_number_counts:
                 z_vals_fb = np.asarray(self.redshift_vec)
                 for i in range(self.cnc_params["n_z"]):
                     if return_profile_params and self.cnc_params["include_wl_bias"]:
-                        ln_M, hmf_eval, profile_params, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
+                        ln_M, hmf_eval, profile_params, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True,include_wl_bias=True)
                         profile_params_list.append(profile_params)
                         ln_M_debiased_list.append(ln_M_debiased)
                     elif return_profile_params:
                         ln_M, hmf_eval, profile_params = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
                         profile_params_list.append(profile_params)
                     elif self.cnc_params["include_wl_bias"]:
-                        ln_M, hmf_eval, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
+                        ln_M, hmf_eval, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,include_wl_bias=True)
                         ln_M_debiased_list.append(ln_M_debiased)
                     else:
                         ln_M, hmf_eval = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element)
