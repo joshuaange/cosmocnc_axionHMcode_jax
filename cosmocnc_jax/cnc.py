@@ -734,8 +734,6 @@ class cluster_number_counts:
         self.cosmo_params = dict(cosmo_params_default)
         self.scal_rel_params = dict(scaling_relation_params_default)
 
-        self.include_wl_bias = self.cnc_params["include_wl_bias"]
-
         self.abundance_matrix = None
         self.n_obs_matrix = None
         self.hmf_matrix = None
@@ -815,7 +813,7 @@ class cluster_number_counts:
             for observable in observable_set:
 
                 self.scaling_relations[observable] = self.scaling_relations_survey(observable=observable,cnc_params=self.cnc_params,catalogue=self.catalogue)
-                self.scaling_relations[observable].initialise_scaling_relation(cosmology=self.cosmology,include_wl_bias=self.include_wl_bias)
+                self.scaling_relations[observable].initialise_scaling_relation(cosmology=self.cosmology)
 
         if self.cnc_params["stacked_likelihood"] == True:
 
@@ -828,7 +826,7 @@ class cluster_number_counts:
                 if observable not in self.cnc_params["observables"]:
 
                     self.scaling_relations[observable] = self.scaling_relations_survey(observable=observable,cnc_params=self.cnc_params,catalogue=self.catalogue)
-                    self.scaling_relations[observable].initialise_scaling_relation(cosmology=self.cosmology,include_wl_bias=self.include_wl_bias)
+                    self.scaling_relations[observable].initialise_scaling_relation(cosmology=self.cosmology)
 
         self.scatter = self.scatter_survey(params=self.scal_rel_params,catalogue=self.catalogue)
         self.scatter_ref = self.scatter_survey(params=self.scal_rel_params,catalogue=self.catalogue)
@@ -1066,7 +1064,7 @@ class cluster_number_counts:
                         # 1D or 3+D: generic wrapper
                         jit_fn = build_sub_bc_jit(
                             sub_l0, sub_l1, sub_aux, sub_pref, sub_npsr,
-                            r, n_points_dl, nd_circ, self.include_wl_bias)
+                            r, n_points_dl, nd_circ)
                         self._sub_bc_jits[(s_idx, sub_indices)] = {
                             'type': 'generic', 'jit_fn': jit_fn,
                         }
@@ -1438,7 +1436,10 @@ class cluster_number_counts:
 
     #Computes the hmf as a function of redshift
 
-    def get_hmf(self,volume_element=True):
+    def get_hmf(self,volume_element=True,return_profile_params=False):
+
+        if (return_profile_params or self.cnc_params["include_wl_bias"]) and not (self.cnc_params["hmf_type"] == "ST_axionHMcode"):
+            print("Returning profile parameters is only currently allowed with hmf_type=ST_axionHMcode")
 
         if self.cnc_params["hmf_type"] == "ST_axionHMcode":
             if "G_a_precomputed" in self.cosmo_params:
@@ -1519,8 +1520,7 @@ class cluster_number_counts:
         self.halo_mass_function = halo_mass_function(cosmology=self.cosmology,hmf_type=self.cnc_params["hmf_type"],
         mass_definition=self.cnc_params["mass_definition"],M_min=self.cnc_params["M_min"],M_min_cutoff=self.cnc_params["M_min_cutoff"],
         M_max=self.cnc_params["M_max"],n_points=self.cnc_params["n_points"],type_deriv=self.cnc_params["hmf_type_deriv"],
-        hmf_calc=self.cnc_params["hmf_calc"],extra_params=self.hmf_extra_params,logger = self.logger,interp_tinker=self.cnc_params["interp_tinker"],
-        include_wl_bias=self.include_wl_bias)
+        hmf_calc=self.cnc_params["hmf_calc"],extra_params=self.hmf_extra_params,logger = self.logger,interp_tinker=self.cnc_params["interp_tinker"])
 
         t0 = time.time()
 
@@ -1629,19 +1629,33 @@ class cluster_number_counts:
             else:
                 # Fallback for hmf_calc="hmf" — keep original loop
                 hmf_list = []
-                if self.include_wl_bias:
+                if return_profile_params:
+                    profile_params_list = []
+                if self.cnc_params["include_wl_bias"]:
                     ln_M_debiased_list = []
                 z_vals_fb = np.asarray(self.redshift_vec)
                 for i in range(self.cnc_params["n_z"]):
-                    if self.include_wl_bias:
-                        ln_M, hmf_eval, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element)
+                    if return_profile_params and self.cnc_params["include_wl_bias"]:
+                        ln_M, hmf_eval, profile_params, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
+                        profile_params_list.append(profile_params)
+                        ln_M_debiased_list.append(ln_M_debiased)
+                    elif return_profile_params:
+                        ln_M, hmf_eval, profile_params = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
+                        profile_params_list.append(profile_params)
+                    elif self.cnc_params["include_wl_bias"]:
+                        ln_M, hmf_eval, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
                         ln_M_debiased_list.append(ln_M_debiased)
                     else:
                         ln_M, hmf_eval = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element)
                     hmf_list.append(hmf_eval)
 
                 self.ln_M = ln_M
-                if self.include_wl_bias:
+                if return_profile_params:
+                    self.profile_params = {
+                        k: jnp.stack([d[k] for d in profile_params_list])
+                        for k in profile_params_list[0].keys()
+                    }
+                if self.cnc_params["include_wl_bias"]:
                     self.ln_M_debiased = jnp.stack(ln_M_debiased_list)
                 self.hmf_matrix = jnp.stack(hmf_list)
 

@@ -147,14 +147,9 @@ class halo_mass_function:
                  hmf_calc="cnc",
                  extra_params=None,
                  logger = None,
-                 interp_tinker=None,
-                 include_wl_bias=False):
+                 interp_tinker=None):
 
-        self.include_wl_bias = include_wl_bias
         self.hmf_type = hmf_type
-
-        if self.include_wl_bias == 1 and not self.hmf_type == "ST_axionHMcode":
-            print("WL bias only currently implemented for ST_axionHMcode as an hmf type")
 
         self.mass_definition = mass_definition
         self.cosmology = cosmology
@@ -203,7 +198,10 @@ class halo_mass_function:
                                                          n=cosmology.cosmo_params["n_s"])
 
     def eval_hmf(self,redshift,log=False,volume_element=False,save_sigma_r=False,load_sigma_r=False,
-    M_min=None,M_max=None,n_points=None):
+    M_min=None,M_max=None,n_points=None,return_profile_params=False,include_wl_bias=False):
+
+        if include_wl_bias == 1 and not self.hmf_type == "ST_axionHMcode":
+            print("WL bias only currently implemented for ST_axionHMcode as an hmf type")
 
         if M_min is None:
 
@@ -245,7 +243,6 @@ class halo_mass_function:
                 R_200c = (3. * M_vec / (4. * np.pi * rho_crit_z* Del))**(1./3.) # Mpc
                 # virial
                 rho_m = self.rho_c_0 * Om0 # Msol/Mpc^3
-                #rho_m_with_h_units = rho_m/self.h**2 # h^2 Msol/Mpc
                 #G_a = func_axionHMcode_D_z_unnorm_int(0., Om0, E_z)_
                 #g_a = func_axionHMcode_D_z_unnorm(redshift, Om0, E_z)*(1+redshift)
                 g_a = np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full) * self.cosmology.normalisation_cached * (1 + redshift)
@@ -263,13 +260,13 @@ class halo_mass_function:
                     M_vec_coarse = np.exp(np.linspace(np.log(M_vec.min()), np.log(M_vec.max()), n_coarse))
                     R_200c_coarse = (3. * M_vec_coarse / (4. * np.pi * rho_crit_z * Del))**(1./3.)
 
-                    if self.include_wl_bias:
+                    if return_profile_params or include_wl_bias:
                         Mvir_coarse, R_vir_vec_coarse, r_s_vec_coarse, delta_char_vec_coarse = find_M_vir_from_M_200c(M_vec_coarse, R_200c_coarse, 
                                                            rho_m, rho_crit_z,
                                                            Delta_vir, c_min, redshift, Om0, sigma_r,
                                                            self.cosmology.normalisation_cached, delta_c, E_z,
                                                            self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                                           min_factor = 0.1, max_factor=20, return_profile_params=self.include_wl_bias)
+                                                           min_factor = 0.1, max_factor=20, return_profile_params=True)
                         Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(Mvir_coarse))),\
                                                                        np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(R_vir_vec_coarse))),\
                                                                        np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(r_s_vec_coarse))),\
@@ -283,13 +280,13 @@ class halo_mass_function:
                                                            min_factor = 0.1, max_factor=20)
                         Mvir_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(Mvir_coarse)))
                 else:
-                    if self.include_wl_bias:
+                    if return_profile_params or include_wl_bias:
                         Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
                                                                        rho_m, rho_crit_z,
                                                                        Delta_vir, c_min, redshift, Om0, sigma_r,
                                                                        self.cosmology.normalisation_cached, delta_c, E_z,
                                                                        self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                                                       min_factor = 0.1, max_factor=20, return_profile_params=self.include_wl_bias)
+                                                                       min_factor = 0.1, max_factor=20, return_profile_params=True)
                     else:
                         Mvir_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
                                                            rho_m, rho_crit_z,
@@ -316,6 +313,23 @@ class halo_mass_function:
                 hmf_vir = 0.5 * (rho_m / Mvir_vec**2) * func_sheth_tormen * np.abs(dlnsigma2_dlnMvir) # 1/M_vir dn/dlnM_vir = dn/dM_vir
                 hmf = hmf_vir * np.gradient(Mvir_vec, M_vec) # dn/dM200c
 
+                if include_wl_bias:
+                    b_WL0  = self.cosmology.cosmo_params['b_WL0']
+                    b_WLM  = self.cosmology.cosmo_params['b_WLM']
+                    h      = self.cosmology.cosmo_params['h']
+                    R_min  = self.cosmology.cosmo_params.get('R_min', 0.5) # Mpc/h
+                    R_max  = self.cosmology.cosmo_params.get('R_max', None) # Mpc/h
+                    c_nfw  = self.cosmology.cosmo_params.get('c_nfw', 3.5) # technically c_200
+                    M_0    = self.cosmology.cosmo_params.get('M_WL0', 2e14) # Msol/h
+
+                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
+                        M_WL = func_Bocquet_get_MWL(M_vec_coarse, redshift, r_s_vec_coarse, rho_crit_z, delta_char_vec_coarse, rho_m, R_min, R_max, c_nfw, h, R_proj_arr_num=100)
+                        M_debiased = M_0 * np.exp((np.log(M_WL*h / M_0) - b_WL0) / b_WLM) / h # Msol
+                        M_debiased = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(M_debiased)))
+                    else:
+                        M_WL = func_Bocquet_get_MWL(M_vec, redshift, r_s_vec, rho_crit_z, delta_char_vec, rho_m, R_min, R_max, c_nfw, h, R_proj_arr_num=100)
+                        M_debiased = M_0 * np.exp((np.log(M_WL*h / M_0) - b_WL0) / b_WLM) / h # Msol
+                        
                 M_eval = M_vec
 
                 hmf    = hmf * 1e14
@@ -325,23 +339,8 @@ class halo_mass_function:
                     hmf    = hmf * M_eval 
                     M_eval = np.log(M_eval)
 
-                if self.include_wl_bias:
-                    b_WL0  = self.cosmology.cosmo_params['b_WL0']
-                    b_WLM  = self.cosmology.cosmo_params['b_WLM']
-                    h      = self.cosmology.cosmo_params['h']
-                    R_min  = self.cosmology.cosmo_params.get('R_min', 0.5) # Mpc/h
-                    R_max  = self.cosmology.cosmo_params.get('R_max', "Bocquet") # Mpc/h
-                    c_nfw  = self.cosmology.cosmo_params.get('c_nfw', 3.5) # technically c_200
-                    M_0    = self.cosmology.cosmo_params.get('M_WL0', 2e14) # Msol/h
-
-                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                        M_WL = func_Bocquet_get_MWL(M_vec_coarse, redshift, r_s_vec, rho_crit_z, delta_char_vec, rho_m, c_nfw, R_min, R_max, h) * h # Msol/h
-                        M_debiased = M_0 * np.exp((np.log(M_WL / M_0) - b_WL0) / b_WLM) / h # Msol
-                        ln_M_debiased = np.log(M_debiased / 1e14)
-                    else:
-                        M_WL = func_Bocquet_get_MWL(M_vec, redshift, r_s_vec, rho_crit_z, delta_char_vec, rho_m, c_nfw, R_min, R_max, h) * h # Msol/h
-                        M_debiased = M_0 * np.exp((np.log(M_WL / M_0) - b_WL0) / b_WLM) / h # Msol
-                        ln_M_debiased = np.log(M_debiased / 1e14)
+                    if include_wl_bias:
+                        M_debiased = np.log(M_debiased / 1e14)
 
             if self.hmf_type == "Tinker08":
 
@@ -463,8 +462,24 @@ class halo_mass_function:
             else:
                 hmf = hmf * cutoff_mask
 
-        if self.include_wl_bias:     
-            return M_eval,hmf,ln_M_debiased
+        if return_profile_params and include_wl_bias:     
+            return M_eval,hmf,{
+                'rho_crit'   : rho_crit_z,
+                'R_vir'      : R_vir_vec,
+                'r_s'        : r_s_vec,
+                'delta_char' : delta_char_vec,
+                'rho_m'      : rho_m  # scalar, same for all M at this z
+            },M_debiased
+        elif return_profile_params:     
+            return M_eval,hmf,{
+                'rho_crit'   : rho_crit_z,
+                'R_vir'      : R_vir_vec,
+                'r_s'        : r_s_vec,
+                'delta_char' : delta_char_vec,
+                'rho_m'      : rho_m  # scalar, same for all M at this z
+            }
+        elif include_wl_bias:
+            return M_eval,hmf,M_debiased
         return M_eval,hmf
 
 
@@ -870,11 +885,11 @@ def func_NFW_DeltaSigma(R_proj_arr, M200c, r200c, c_nfw):
     DeltaSigma = mean_Sigma - Sigma
     return DeltaSigma
 
-def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, c_nfw, R_min, R_max, h_fid,
-                        R_proj_arr_num = 100):
+def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, R_min, R_max, c_nfw, h_fid, R_proj_arr_num=100):
     rho_s_arr = delta_char * rho_m
+    # note c_nfw is c_200c
     # Aperture settings from Bocquet
-    if R_max == "Bocquet" and z is not None:
+    if R_max is None:
         R_max = 3.2 / (1. + z)
     R_fit = np.linspace(R_min, R_max, R_proj_arr_num) / h_fid # note: in Mpc
     x          = R_fit[:, None] / r_s_arr[None, :]
@@ -910,17 +925,18 @@ def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, c_nfw, 
     mean_Sigma = 4 * rho_s_arr[None, :] * r_s_arr[None, :] / x**2 * g(x)
     DeltaSigma_theory = (mean_Sigma - Sigma).T
     
+
     MWL_arr = np.zeros(len(M200c))
     for i in range(len(M200c)):
         def model(R, M_WL):
             # M_WL in Msol (no h), R in Mpc (no h)
             r200c = (3 * M_WL / (4 * np.pi * 200 * rho_crit))**(1/3)  # Mpc
-            return func_NFW_DeltaSigma(R, M_WL, r200c, c_nfw)              # Msol/Mpc^2
+            return func_NFW_DeltaSigma(R, M_WL, r200c, c_nfw)               # Msol/Mpc^2
 
         popt, _ = curve_fit(model, R_fit, DeltaSigma_theory[i], p0=[M200c[i]])
         MWL_arr[i] = popt[0]                            # Msol, no h
 
-    return np.asarray(MWL_arr)   # Msol
+    return MWL_arr   # Msol
 
 
 class hmf_params:
