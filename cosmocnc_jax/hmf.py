@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import jaxopt
 import functools
 import numpy as np
 import time
@@ -198,10 +199,7 @@ class halo_mass_function:
                                                          n=cosmology.cosmo_params["n_s"])
 
     def eval_hmf(self,redshift,log=False,volume_element=False,save_sigma_r=False,load_sigma_r=False,
-    M_min=None,M_max=None,n_points=None,return_profile_params=False,include_wl_bias=False):
-
-        if include_wl_bias == 1 and not self.hmf_type == "ST_axionHMcode":
-            print("WL bias only currently implemented for ST_axionHMcode as an hmf type")
+    M_min=None,M_max=None,n_points=None,return_profile_params=False):
 
         if M_min is None:
 
@@ -252,6 +250,7 @@ class halo_mass_function:
                 c_min = 5.196 # should turn this into a parameter
                 k, ps = self.cosmology.power_spectrum.get_linear_power_spectrum(redshift)
                 sigma_r = sigma_R((k, ps), cosmology=self.cosmology)
+                sigma_r.get_derivative(type_deriv=self.type_deriv)
                 #normalisation = func_axionHMcode_D_z_unnorm(0., Om0, E_z)
                 delta_c   = func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a)
                 # Solve on coarse grid
@@ -260,7 +259,7 @@ class halo_mass_function:
                     M_vec_coarse = np.exp(np.linspace(np.log(M_vec.min()), np.log(M_vec.max()), n_coarse))
                     R_200c_coarse = (3. * M_vec_coarse / (4. * np.pi * rho_crit_z * Del))**(1./3.)
 
-                    if return_profile_params or include_wl_bias:
+                    if return_profile_params:
                         Mvir_coarse, R_vir_vec_coarse, r_s_vec_coarse, delta_char_vec_coarse = find_M_vir_from_M_200c(M_vec_coarse, R_200c_coarse, 
                                                            rho_m, rho_crit_z,
                                                            Delta_vir, c_min, redshift, Om0, sigma_r,
@@ -271,6 +270,7 @@ class halo_mass_function:
                                                                        np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(R_vir_vec_coarse))),\
                                                                        np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(r_s_vec_coarse))),\
                                                                        np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(delta_char_vec_coarse)))
+                        R_vir_vec_coarse = (3. * Mvir_coarse / (4. * np.pi * rho_m * Delta_vir))**(1./3.) # Mpc/h
                     else:
                         Mvir_coarse = find_M_vir_from_M_200c(M_vec_coarse, R_200c_coarse, 
                                                            rho_m, rho_crit_z,
@@ -280,13 +280,16 @@ class halo_mass_function:
                                                            min_factor = 0.1, max_factor=20)
                         Mvir_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(Mvir_coarse)))
                 else:
-                    if return_profile_params or include_wl_bias:
+                    if return_profile_params:
                         Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
                                                                        rho_m, rho_crit_z,
                                                                        Delta_vir, c_min, redshift, Om0, sigma_r,
                                                                        self.cosmology.normalisation_cached, delta_c, E_z,
                                                                        self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
                                                                        min_factor = 0.1, max_factor=20, return_profile_params=True)
+                        r_s_vec_coarse = r_s_vec
+                        delta_char_vec_coarse = delta_char_vec
+                        R_vir_vec_coarse = R_vir_vec
                     else:
                         Mvir_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
                                                            rho_m, rho_crit_z,
@@ -295,10 +298,8 @@ class halo_mass_function:
                                                            self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
                                                            min_factor = 0.1, max_factor=20)
                 #Mvir_vec_with_h_units = Mvir_vec*self.h # Msol/h
-                R_vir = (3. * Mvir_vec / (4. * np.pi * rho_m * Delta_vir))**(1./3.) # Mpc/h
+                #R_vir = (3. * Mvir_vec / (4. * np.pi * rho_m * Delta_vir))**(1./3.) # Mpc/h
                 #R_vir_with_h_units = (3. * Mvir_vec_with_h_units / (4. * np.pi * rho_m_with_h_units * Delta_vir))**(1./3.) # Mpc/h
-
-                sigma_r.get_derivative(type_deriv=self.type_deriv)
                 (sigma, dsigmadR_vir) = sigma_r.get_sigma_M(Mvir_vec, rho_m, get_deriv=True)
                 R_lagrangian = sigma_r.R_eval   # the R that get_sigma_M actually used
                 dM_dR_lagrangian = 4. * np.pi * rho_m * R_lagrangian**2
@@ -312,24 +313,7 @@ class halo_mass_function:
 
                 hmf_vir = 0.5 * (rho_m / Mvir_vec**2) * func_sheth_tormen * np.abs(dlnsigma2_dlnMvir) # 1/M_vir dn/dlnM_vir = dn/dM_vir
                 hmf = hmf_vir * np.gradient(Mvir_vec, M_vec) # dn/dM200c
-
-                if include_wl_bias:
-                    b_WL0  = self.cosmology.cosmo_params['b_WL0']
-                    b_WLM  = self.cosmology.cosmo_params['b_WLM']
-                    h      = self.cosmology.cosmo_params['h']
-                    R_min  = self.cosmology.cosmo_params.get('R_min', 0.5) # Mpc/h
-                    R_max  = self.cosmology.cosmo_params.get('R_max', None) # Mpc/h
-                    c_nfw  = self.cosmology.cosmo_params.get('c_nfw', 3.5) # technically c_200
-                    M_0    = self.cosmology.cosmo_params.get('M_WL0', 2e14) # Msol/h
-
-                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                        M_WL = func_Bocquet_get_MWL(M_vec_coarse, redshift, r_s_vec_coarse, rho_crit_z, delta_char_vec_coarse, rho_m, R_min, R_max, c_nfw, h, R_proj_arr_num=100)
-                        M_debiased = M_0 * np.exp((np.log(M_WL*h / M_0) - b_WL0) / b_WLM) / h # Msol
-                        M_debiased = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(M_debiased)))
-                    else:
-                        M_WL = func_Bocquet_get_MWL(M_vec, redshift, r_s_vec, rho_crit_z, delta_char_vec, rho_m, R_min, R_max, c_nfw, h, R_proj_arr_num=100)
-                        M_debiased = M_0 * np.exp((np.log(M_WL*h / M_0) - b_WL0) / b_WLM) / h # Msol
-                        
+                    
                 M_eval = M_vec
 
                 hmf    = hmf * 1e14
@@ -338,9 +322,6 @@ class halo_mass_function:
                 if log == True:
                     hmf    = hmf * M_eval 
                     M_eval = np.log(M_eval)
-
-                    if include_wl_bias:
-                        M_debiased = np.log(M_debiased / 1e14)
 
             if self.hmf_type == "Tinker08":
 
@@ -462,24 +443,15 @@ class halo_mass_function:
             else:
                 hmf = hmf * cutoff_mask
 
-        if return_profile_params and include_wl_bias:     
+        if return_profile_params:     
             return M_eval,hmf,{
+                'M_vec'      : M_vec,
                 'rho_crit'   : rho_crit_z,
-                'R_vir'      : R_vir_vec,
-                'r_s'        : r_s_vec,
-                'delta_char' : delta_char_vec,
-                'rho_m'      : rho_m  # scalar, same for all M at this z
-            },M_debiased
-        elif return_profile_params:     
-            return M_eval,hmf,{
-                'rho_crit'   : rho_crit_z,
-                'R_vir'      : R_vir_vec,
-                'r_s'        : r_s_vec,
-                'delta_char' : delta_char_vec,
+                'R_vir'      : R_vir_vec_coarse,
+                'r_s'        : r_s_vec_coarse,
+                'delta_char' : delta_char_vec_coarse,
                 'rho_m'      : rho_m  # scalar, same for all M at this z
             }
-        elif include_wl_bias:
-            return M_eval,hmf,M_debiased
         return M_eval,hmf
 
 
@@ -769,11 +741,11 @@ def func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a, version='dome'):
         return 1.686 *(1-0.041*f_frac)* ( 1 + f_1*np.log10(Omega_m_z)**alpha_1 + f_2*np.log10(Omega_m_z)**alpha_2)
     else:
         return 1.686 * ( 1 + f_1*np.log10(Omega_m_z)**alpha_1 + f_2*np.log10(Omega_m_z)**alpha_2)
-
+'''
 def find_M_vir_from_M_200c(M_vec_with_h, R_200c_with_h, rho_m_with_h, rho_crit_z_with_h,
                             Delta_vir, c_min, redshift, Om0, sigma_r, 
                             normalisation, delta_c, E_z, D_grid_z_full, D_grid_full,
-                            min_factor = 0.1, max_factor=20, return_profile_params=False):
+                            min_factor = 0.5, max_factor=10, return_profile_params=False):
     def g(x):
         # NFW enclosed mass shape function
         return np.log(1. + x) - x / (1. + x)
@@ -850,95 +822,99 @@ def find_M_vir_from_M_200c(M_vec_with_h, R_200c_with_h, rho_m_with_h, rho_crit_z
         return Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec
     else:
         return np.vectorize(solve_single)(M_vec_with_h, R_200c_with_h)
-
-def func_NFW_DeltaSigma(R_proj_arr, M200c, r200c, c_nfw):
-    r_s = r200c / c_nfw
-    rho_s = M200c / (4 * np.pi * r_s**3 * (np.log(1 + c_nfw) - c_nfw/(1+c_nfw)))
-    
-    x = R_proj_arr / r_s
-    
-    # Sigma(R) for NFW - analytical
-    def f(x):
-        result = np.zeros_like(x, dtype=float)
-        mask1 = x < 1
-        mask2 = x > 1
-        mask3 = x == 1
-        result[mask1] = 1/np.sqrt(1-x[mask1]**2) * np.arctanh(np.sqrt(1-x[mask1]**2))
-        result[mask2] = 1/np.sqrt(x[mask2]**2-1) * np.arctan(np.sqrt(x[mask2]**2-1))
-        result[mask3] = 1.0
-        return result
-    
-    Sigma = 2 * rho_s * r_s / (x**2 - 1) * (1 - f(x))
-    
-    # Mean Sigma within R for NFW - analytical
+'''
+@functools.partial(jax.jit, static_argnums=())
+def _find_M_vir_jit(log_lo, log_hi, R_200c, rho_m, Delta_vir, c_min,
+                     redshift, log_M_vir_grid, z_f_grid, n_iter=60):
+    """JIT-compiled bisection for M_vir given M_200c array."""
     def g(x):
-        result = np.zeros_like(x, dtype=float)
-        mask1 = x < 1
-        mask2 = x > 1
-        mask3 = x == 1
-        result[mask1] = np.log(x[mask1]/2) + 1/np.sqrt(1-x[mask1]**2) * np.arctanh(np.sqrt(1-x[mask1]**2))
-        result[mask2] = np.log(x[mask2]/2) + 1/np.sqrt(x[mask2]**2-1) * np.arctan(np.sqrt(x[mask2]**2-1))
-        result[mask3] = 1 + np.log(0.5)
-        return result
-    
-    mean_Sigma = 4 * rho_s * r_s / x**2 * g(x)
-    DeltaSigma = mean_Sigma - Sigma
-    return DeltaSigma
+        return jnp.log(1. + x) - x / (1. + x)
 
-def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, R_min, R_max, c_nfw, h_fid, R_proj_arr_num=100):
-    rho_s_arr = delta_char * rho_m
-    # note c_nfw is c_200c
-    # Aperture settings from Bocquet
-    if R_max is None:
-        R_max = 3.2 / (1. + z)
-    R_fit = np.linspace(R_min, R_max, R_proj_arr_num) / h_fid # note: in Mpc
-    x          = R_fit[:, None] / r_s_arr[None, :]
+    def body(carry, _):
+        lo, hi = carry
+        mid = 0.5 * (lo + hi)
+        Mvir = jnp.exp(mid)
+        z_f = jnp.interp(mid, log_M_vir_grid, z_f_grid)
+        conc = c_min * (1. + z_f) / (1. + redshift)
+        R_vir = (3. * Mvir / (4. * jnp.pi * rho_m * Delta_vir))**(1./3.)
+        r_s = R_vir / conc
+        delta_char = Delta_vir * conc**3 / (3. * g(conc))
+        x_200c = R_200c / r_s
+        M_enc = 4. * jnp.pi * delta_char * rho_m * r_s**3 * g(x_200c)
+        lo = jnp.where(M_enc < jnp.exp(log_lo + log_hi - mid), mid, lo)  # wrong
+        return (lo, hi), None
 
-    def f(x):
-        result = np.zeros_like(x)
-        m1 = x < 1
-        m2 = x > 1
-        m3 = np.abs(x - 1) < 1e-6
-        result[m1] = (1/np.sqrt(1 - x[m1]**2)
-                      * np.arctanh(np.sqrt(1 - x[m1]**2)))
-        result[m2] = (1/np.sqrt(x[m2]**2 - 1)
-                      * np.arctan(np.sqrt(x[m2]**2 - 1)))
-        result[m3] = 1.0
-        return result
-
+    def body_fixed(carry, _):
+        lo, hi, M200c_arr = carry
+        mid = 0.5 * (lo + hi)
+        Mvir = jnp.exp(mid)
+        z_f = jnp.interp(mid, log_M_vir_grid, z_f_grid)  # scalar per mass point — need vmap
+        ...
+        
+@jax.jit
+def _bisect_single(log_lo, log_hi, M200c, R200c, rho_m, Delta_vir, c_min,
+                   redshift, log_M_vir_grid, z_f_grid):
     def g(x):
-        result = np.zeros_like(x)
-        m1 = x < 1
-        m2 = x > 1
-        m3 = np.abs(x - 1) < 1e-6
-        result[m1] = (np.log(x[m1]/2)
-                      + 1/np.sqrt(1 - x[m1]**2)
-                      * np.arctanh(np.sqrt(1 - x[m1]**2)))
-        result[m2] = (np.log(x[m2]/2)
-                      + 1/np.sqrt(x[m2]**2 - 1)
-                      * np.arctan(np.sqrt(x[m2]**2 - 1)))
-        result[m3] = 1 + np.log(0.5)
-        return result
+        return jnp.log(1. + x) - x / (1. + x)
 
-    # (n_R, n_M)
-    Sigma      = 2 * rho_s_arr[None, :] * r_s_arr[None, :] / (x**2 - 1) * (1 - f(x))
-    mean_Sigma = 4 * rho_s_arr[None, :] * r_s_arr[None, :] / x**2 * g(x)
-    DeltaSigma_theory = (mean_Sigma - Sigma).T
+    def body(carry, _):
+        lo, hi = carry
+        mid = 0.5 * (lo + hi)
+        Mvir = jnp.exp(mid)
+        z_f = jnp.interp(mid, log_M_vir_grid, z_f_grid)
+        conc = c_min * (1. + z_f) / (1. + redshift)
+        R_vir = (3. * Mvir / (4. * jnp.pi * rho_m * Delta_vir))**(1./3.)
+        r_s = R_vir / conc
+        delta_char = Delta_vir * conc**3 / (3. * g(conc))
+        x_200c = R200c / r_s
+        M_enc = 4. * jnp.pi * delta_char * rho_m * r_s**3 * g(x_200c)
+        lo = jnp.where(M_enc < M200c, mid, lo)
+        hi = jnp.where(M_enc < M200c, hi, mid)
+        return (lo, hi), None
+
+    (lo, hi), _ = jax.lax.scan(body, (log_lo, log_hi), None, length=30)
+    mid = 0.5 * (lo + hi)
+    Mvir = jnp.exp(mid)
+    z_f = jnp.interp(mid, log_M_vir_grid, z_f_grid)
+    conc = c_min * (1. + z_f) / (1. + redshift)
+    R_vir = (3. * Mvir / (4. * jnp.pi * rho_m * Delta_vir))**(1./3.)
+    r_s = R_vir / conc
+    delta_char = Delta_vir * conc**3 / (3. * g(conc))
+    return Mvir, r_s, delta_char
+
+_bisect_vmap = jax.jit(jax.vmap(_bisect_single,
+    in_axes=(0, 0, 0, 0, None, None, None, None, None, None)))
+
+def find_M_vir_from_M_200c(M_vec, R_200c, rho_m, rho_crit_z,
+                            Delta_vir, c_min, redshift, Om0, sigma_r,
+                            normalisation, delta_c, E_z, D_grid_z_full, D_grid_full,
+                            min_factor=0.5, max_factor=10, return_profile_params=False):
+    # Precompute z_formation grid (numpy, not JIT-able due to sigma_r)
+    M_vir_grid = np.exp(np.linspace(
+        np.log(min_factor * M_vec.min()),
+        np.log(max_factor * M_vec.max()), 300))
+    z_formation_interp = func_axionHMcode_z_formation_fast(
+        redshift, M_vir_grid, rho_m, Om0, sigma_r,
+        normalisation, delta_c, E_z, D_grid_z_full, D_grid_full)
+
+    log_M_vir_grid = jnp.asarray(np.log(M_vir_grid))
+    z_f_grid = jnp.asarray(np.array([z_formation_interp(m) for m in M_vir_grid]))
+
+    log_lo = jnp.log(jnp.asarray(min_factor * M_vec))
+    log_hi = jnp.log(jnp.asarray(max_factor * M_vec))
+    M200c_jnp = jnp.asarray(M_vec)
+    R200c_jnp = jnp.asarray(R_200c)
+
+    Mvir_vec, r_s_vec, delta_char_vec = _bisect_vmap(
+        log_lo, log_hi, M200c_jnp, R200c_jnp,
+        float(rho_m), float(Delta_vir), float(c_min), float(redshift),
+        log_M_vir_grid, z_f_grid)
+
+    if return_profile_params:
+        R_vir_vec = (3. * Mvir_vec / (4. * jnp.pi * rho_m * Delta_vir))**(1./3.)
+        return np.asarray(Mvir_vec), np.asarray(R_vir_vec), np.asarray(r_s_vec), np.asarray(delta_char_vec)
+    return np.asarray(Mvir_vec)
     
-
-    MWL_arr = np.zeros(len(M200c))
-    for i in range(len(M200c)):
-        def model(R, M_WL):
-            # M_WL in Msol (no h), R in Mpc (no h)
-            r200c = (3 * M_WL / (4 * np.pi * 200 * rho_crit))**(1/3)  # Mpc
-            return func_NFW_DeltaSigma(R, M_WL, r200c, c_nfw)               # Msol/Mpc^2
-
-        popt, _ = curve_fit(model, R_fit, DeltaSigma_theory[i], p0=[M200c[i]])
-        MWL_arr[i] = popt[0]                            # Msol, no h
-
-    return MWL_arr   # Msol
-
-
 class hmf_params:
 
     def __init__(self, hmf_type="Tinker08", mass_definition="500c", other_params=None):

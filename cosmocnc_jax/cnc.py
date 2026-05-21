@@ -15,13 +15,149 @@ import sys
 from itertools import combinations
 
 
+# wl bias
+
+def _f_nfw(x):
+    x = jnp.asarray(x)
+
+    def x_lt_1(x):
+        return 1.0 / jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
+
+    def x_gt_1(x):
+        return 1.0 / jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
+
+    return jnp.where(x < 1, x_lt_1(x),
+           jnp.where(x > 1, x_gt_1(x), 1.0))
+
+def _g_nfw(x):
+    x = jnp.asarray(x)
+
+    def x_lt_1(x):
+        return jnp.log(x/2) + 1/jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
+
+    def x_gt_1(x):
+        return jnp.log(x/2) + 1/jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
+
+    return jnp.where(x < 1, x_lt_1(x),
+           jnp.where(x > 1, x_gt_1(x), 1 + jnp.log(0.5)))
+    
+def func_NFW_DeltaSigma(R, M, rho_crit, c_nfw):
+
+    r_200 = (3.0 * M / (4.0 * jnp.pi * 200.0 * rho_crit))**(1.0 / 3.0)
+    r_s = r_200 / c_nfw
+
+    g_c = jnp.log(1 + c_nfw) - c_nfw / (1 + c_nfw)
+    rho_s = M / (4.0 * jnp.pi * r_s**3 * g_c)
+
+    x = R / r_s
+
+    Sigma = 2.0 * rho_s * r_s / (x**2 - 1.0) * (1.0 - _f_nfw(x))
+    Sigma_bar = 4.0 * rho_s * r_s / x**2 * _g_nfw(x)
+
+    return Sigma_bar - Sigma
+
+def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, R_min, R_max_type, c_nfw, h_fid, R_proj_arr_num=100):
+    rho_s_arr = delta_char * rho_m
+    if R_max_type is None:
+        R_max = 3.2 / (1. + z)
+    else:
+        R_max = R_max_type
+    R_fit = np.linspace(R_min, R_max, R_proj_arr_num) / h_fid
+
+    def _f(x):
+        out = np.ones_like(x)
+        m1, m2 = x < 1, x > 1
+        out[m1] = np.arctanh(np.sqrt(np.maximum(1-x[m1]**2, 0))) / np.sqrt(np.maximum(1-x[m1]**2, 1e-30))
+        out[m2] = np.arctan( np.sqrt(np.maximum(x[m2]**2-1, 0))) / np.sqrt(np.maximum(x[m2]**2-1, 1e-30))
+        return out
+
+    def _g(x):
+        out = np.full_like(x, 1 + np.log(0.5))
+        m1, m2 = x < 1, x > 1
+        out[m1] = np.log(x[m1]/2) + np.arctanh(np.sqrt(np.maximum(1-x[m1]**2, 0))) / np.sqrt(np.maximum(1-x[m1]**2, 1e-30))
+        out[m2] = np.log(x[m2]/2) + np.arctan( np.sqrt(np.maximum(x[m2]**2-1, 0))) / np.sqrt(np.maximum(x[m2]**2-1, 1e-30))
+        return out
+
+    # Theory profiles: (n_M, n_R)
+    x_t = R_fit[:, None] / r_s_arr[None, :]
+    DS_theory = (4*rho_s_arr[None,:]*r_s_arr[None,:]/x_t**2*_g(x_t)
+               - 2*rho_s_arr[None,:]*r_s_arr[None,:]/(x_t**2-1)*(1-_f(x_t))).T  # (n_M, n_R)
+
+    # Candidate M_WL grid: (n_search,)
+    n_search = 200
+    M_search = np.exp(np.linspace(np.log(M200c.min()*0.3), np.log(M200c.max()*3.0), n_search))
+    r200c_s = (3*M_search/(4*np.pi*200*rho_crit))**(1/3)
+    rs_s    = r200c_s / c_nfw
+    gc      = np.log(1+c_nfw) - c_nfw/(1+c_nfw)
+    rho_s_s = M_search / (4*np.pi*rs_s**3*gc)
+
+    # Model profiles: (n_search, n_R)
+    x_s = R_fit[:, None] / rs_s[None, :]
+    DS_model = (4*rho_s_s[None,:]*rs_s[None,:]/x_s**2*_g(x_s)
+              - 2*rho_s_s[None,:]*rs_s[None,:]/(x_s**2-1)*(1-_f(x_s))).T  # (n_search, n_R)
+
+    # Normalise by theory amplitude to make residuals scale-independent
+    norm = np.sum(DS_theory**2, axis=1, keepdims=True)**0.5  # (n_M, 1)
+
+    # Residuals: (n_M, n_search) — fully vectorised
+    resid = np.sum((DS_model[None,:,:] - DS_theory[:,None,:])**2, axis=2) / norm**2
+
+    # Best match per true mass
+    j_best = np.argmin(resid, axis=1)
+    return M_search[j_best]
+@jax.jit
+def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
+                    delta_char_matrix, rho_m, R_fit_matrix, c_nfw):
+    """Vmapped over redshifts. 
+    r_s_matrix: (n_z, n_M)
+    delta_char_matrix: (n_z, n_M)  
+    rho_crit_vec: (n_z,)
+    R_max_vec: (n_z,)
+    R_fit_matrix: (n_z, n_R)
+    """
+    def _f(x):
+        out = jnp.ones_like(x)
+        out = jnp.where(x < 1, jnp.arctanh(jnp.sqrt(jnp.maximum(1-x**2, 1e-30))) / jnp.sqrt(jnp.maximum(1-x**2, 1e-30)), out)
+        out = jnp.where(x > 1, jnp.arctan( jnp.sqrt(jnp.maximum(x**2-1, 1e-30))) / jnp.sqrt(jnp.maximum(x**2-1, 1e-30)), out)
+        return out
+
+    def _g(x):
+        out = jnp.full_like(x, 1 + jnp.log(0.5))
+        out = jnp.where(x < 1, jnp.log(x/2) + jnp.arctanh(jnp.sqrt(jnp.maximum(1-x**2, 1e-30))) / jnp.sqrt(jnp.maximum(1-x**2, 1e-30)), out)
+        out = jnp.where(x > 1, jnp.log(x/2) + jnp.arctan( jnp.sqrt(jnp.maximum(x**2-1, 1e-30))) / jnp.sqrt(jnp.maximum(x**2-1, 1e-30)), out)
+        return out
+
+    def single_z(r_s_arr, rho_crit_z, delta_char_arr, R_fit):
+        rho_s_arr = delta_char_arr * rho_m
+        x_t = R_fit[:, None] / r_s_arr[None, :]  # (n_R, n_M)
+        DS_theory = (4*rho_s_arr[None,:]*r_s_arr[None,:]/x_t**2*_g(x_t)
+                   - 2*rho_s_arr[None,:]*r_s_arr[None,:]/(x_t**2-1)*(1-_f(x_t))).T  # (n_M, n_R)
+
+        n_search = 200
+        M_search = jnp.exp(jnp.linspace(jnp.log(M_vec_coarse.min()*0.3),
+                                          jnp.log(M_vec_coarse.max()*3.0), n_search))
+        r200c_s = (3*M_search/(4*jnp.pi*200*rho_crit_z))**(1/3)
+        rs_s = r200c_s / c_nfw
+        gc = jnp.log(1+c_nfw) - c_nfw/(1+c_nfw)
+        rho_s_s = M_search / (4*jnp.pi*rs_s**3*gc)
+        x_s = R_fit[:, None] / rs_s[None, :]  # (n_R, n_search)
+        DS_model = (4*rho_s_s[None,:]*rs_s[None,:]/x_s**2*_g(x_s)
+                  - 2*rho_s_s[None,:]*rs_s[None,:]/(x_s**2-1)*(1-_f(x_s))).T  # (n_search, n_R)
+
+        norm = jnp.sqrt(jnp.sum(DS_theory**2, axis=1, keepdims=True))
+        resid = jnp.sum((DS_model[None,:,:] - DS_theory[:,None,:])**2, axis=2) / norm**2
+        j_best = jnp.argmin(resid, axis=1)
+        return M_search[j_best]  # (n_M,)
+
+    return jax.vmap(single_z, in_axes=(0, 0, 0, 0))(
+        r_s_matrix, rho_crit_vec, delta_char_matrix, R_fit_matrix)
+
 # =====================================================================
 # Generic factory functions for building JIT-compiled kernels
 # =====================================================================
 
 # Number of points for coarse mass range estimation grid
 _N_COARSE_MASS = 128
-
 
 def _tile_to_patches(params_tuple, n_patches):
     """Add leading n_patches dim to each param via broadcast_to (zero-copy).
@@ -1439,7 +1575,7 @@ class cluster_number_counts:
     def get_hmf(self,volume_element=True,return_profile_params=False):
 
         if (return_profile_params or self.cnc_params["include_wl_bias"]) and not (self.cnc_params["hmf_type"] == "ST_axionHMcode"):
-            print("Returning profile parameters is only currently allowed with hmf_type=ST_axionHMcode")
+            print("Returning profile parameters / WL bias is only currently allowed with hmf_type=ST_axionHMcode")
 
         if self.cnc_params["hmf_type"] == "ST_axionHMcode":
             if "G_a_precomputed" in self.cosmo_params:
@@ -1631,20 +1767,11 @@ class cluster_number_counts:
                 hmf_list = []
                 if return_profile_params:
                     profile_params_list = []
-                if self.cnc_params["include_wl_bias"]:
-                    ln_M_debiased_list = []
                 z_vals_fb = np.asarray(self.redshift_vec)
                 for i in range(self.cnc_params["n_z"]):
-                    if return_profile_params and self.cnc_params["include_wl_bias"]:
-                        ln_M, hmf_eval, profile_params, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True,include_wl_bias=True)
-                        profile_params_list.append(profile_params)
-                        ln_M_debiased_list.append(ln_M_debiased)
-                    elif return_profile_params:
+                    if return_profile_params:
                         ln_M, hmf_eval, profile_params = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
                         profile_params_list.append(profile_params)
-                    elif self.cnc_params["include_wl_bias"]:
-                        ln_M, hmf_eval, ln_M_debiased = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,include_wl_bias=True)
-                        ln_M_debiased_list.append(ln_M_debiased)
                     else:
                         ln_M, hmf_eval = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element)
                     hmf_list.append(hmf_eval)
@@ -1655,9 +1782,111 @@ class cluster_number_counts:
                         k: jnp.stack([d[k] for d in profile_params_list])
                         for k in profile_params_list[0].keys()
                     }
-                if self.cnc_params["include_wl_bias"]:
-                    self.ln_M_debiased = jnp.stack(ln_M_debiased_list)
                 self.hmf_matrix = jnp.stack(hmf_list)
+                
+                if self.cnc_params["include_wl_bias"]:
+                    b_WL0 = self.cosmology.cosmo_params['b_WL0']
+                    b_WLM = self.cosmology.cosmo_params['b_WLM']
+                    h     = self.cosmology.cosmo_params['h']
+                    R_min = self.cosmology.cosmo_params.get('R_min', 0.5)
+                    R_max = self.cosmology.cosmo_params.get('R_max', None)
+                    c_nfw = self.cosmology.cosmo_params.get('c_nfw', 3.5)
+                    M_WL0 = self.cosmology.cosmo_params.get('M_WL0', 2e14)
+                    n_wl_skip = self.cosmology.cosmo_params.get("wl_bias_z_downsample", 1)
+                
+                    z_indices_wl = list(range(0, self.cnc_params["n_z"], n_wl_skip))
+                    if (self.cnc_params["n_z"] - 1) not in z_indices_wl:
+                        z_indices_wl.append(self.cnc_params["n_z"] - 1)
+                    z_coarse = z_vals_fb[z_indices_wl]
+                
+                    M_vec_coarse = np.asarray(self.profile_params["M_vec"][0])
+                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
+                        M_vec_coarse = np.exp(np.linspace(
+                            np.log(M_vec_coarse.min()), np.log(M_vec_coarse.max()),
+                            self.cosmology.cosmo_params["n_mass_points_coarse"]))
+                
+                    # Stack profile params for JIT call — (n_z_wl, n_M_coarse)
+                    r_s_matrix      = jnp.stack([jnp.asarray(self.profile_params["r_s"][i])
+                                                  for i in z_indices_wl])
+                    delta_char_matrix = jnp.stack([jnp.asarray(self.profile_params["delta_char"][i])
+                                                    for i in z_indices_wl])
+                    rho_crit_vec    = jnp.array([float(self.profile_params["rho_crit"][i])
+                                                  for i in z_indices_wl])
+                    rho_m_val       = float(self.profile_params["rho_m"][0])
+                
+                    R_max_vec_np = np.array([3.2/(1.+float(z_vals_fb[i])) if R_max is None
+                                              else float(R_max) for i in z_indices_wl])
+                    R_fit_matrix = jnp.stack([jnp.linspace(R_min/h, R_max_vec_np[j]/h, 100)
+                                               for j in range(len(z_indices_wl))])  # (n_z_wl, n_R)
+                
+                    # Single JIT call over all WL redshifts simultaneously → (n_z_wl, n_M_coarse)
+                    M_WL_matrix = _get_MWL_all_z(
+                        jnp.asarray(M_vec_coarse), r_s_matrix, rho_crit_vec,
+                        delta_char_matrix, float(rho_m_val), R_fit_matrix, float(c_nfw))
+                
+                    # Debias → (n_z_wl, n_M_coarse)
+                    ln_M_deb_coarse_arr = np.asarray(
+                        jnp.log(M_WL0 * jnp.exp((jnp.log(M_WL_matrix * h / M_WL0) - b_WL0) / b_WLM) / h / 1e14))
+                
+                    # Interpolate coarse mass grid → full mass grid if needed
+                    M_vec_full = np.asarray(self.profile_params["M_vec"][0])
+                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
+                        ln_M_deb_coarse_arr = np.stack([
+                            np.interp(np.log(M_vec_full), np.log(M_vec_coarse), ln_M_deb_coarse_arr[i, :])
+                            for i in range(ln_M_deb_coarse_arr.shape[0])
+                        ], axis=0)  # (n_z_wl, n_M_full)
+                
+                    # Interpolate coarse z grid → full z grid
+                    ln_M_deb_full = np.stack([
+                        np.interp(z_vals_fb, z_coarse, ln_M_deb_coarse_arr[:, j])
+                        for j in range(ln_M_deb_coarse_arr.shape[1])
+                    ], axis=1)  # (n_z, n_M)
+                
+                    self.ln_M_debiased = jnp.asarray(ln_M_deb_full)
+                    '''
+                    M_vec_coarse = np.exp(self.ln_M) * 1e14
+                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
+                        M_vec_coarse = np.exp(np.linspace(np.log(min(self.profile_params["M_vec"][0])), np.log(max(self.profile_params["M_vec"][0])), self.cosmology.cosmo_params["n_mass_points_coarse"]))
+                    b_WL0 = self.cosmology.cosmo_params['b_WL0']
+                    b_WLM = self.cosmology.cosmo_params['b_WLM']
+                    h     = self.cosmology.cosmo_params['h']
+                    R_min = self.cosmology.cosmo_params.get('R_min', 0.5)
+                    R_max = self.cosmology.cosmo_params.get('R_max', None)
+                    c_nfw = self.cosmology.cosmo_params.get('c_nfw', 3.5)
+                    M_WL0 = self.cosmology.cosmo_params.get('M_WL0', 2e14)
+                    n_wl_skip = self.cosmology.cosmo_params.get("wl_bias_z_downsample", 1)
+                
+                    z_indices_wl = list(range(0, self.cnc_params["n_z"], n_wl_skip))
+                    if (self.cnc_params["n_z"] - 1) not in z_indices_wl:
+                        z_indices_wl.append(self.cnc_params["n_z"] - 1)
+                    z_coarse = z_vals_fb[z_indices_wl]  # <-- was missing
+                            
+                    ln_M_deb_coarse_list = []
+                    for i in z_indices_wl:
+                        redshift  = float(z_vals_fb[i])
+                        rho_crit_z = float(self.profile_params["rho_crit"][i])
+                        rho_m      = float(self.profile_params["rho_m"][i])  # scalar per z
+                        r_s_arr    = np.asarray(self.profile_params["r_s"][i])
+                        delta_char_arr = np.asarray(self.profile_params["delta_char"][i])
+                        M_WL = func_Bocquet_get_MWL(M_vec_coarse, redshift,
+                                                     r_s_arr, rho_crit_z, delta_char_arr,
+                                                     rho_m, R_min, R_max, c_nfw, h)
+                        M_debiased = M_WL0 * np.exp((np.log(M_WL * h / M_WL0) - b_WL0) / b_WLM) / h
+                        ln_M_deb_coarse_list.append(np.log(M_debiased / 1e14))
+
+                    ln_M_deb_coarse_arr = np.stack(ln_M_deb_coarse_list)  # (n_z_coarse, n_M)
+                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
+                        M_vec_full = np.asarray(self.profile_params["M_vec"][0])
+                        ln_M_deb_coarse_arr = np.stack([
+                            np.interp(np.log(M_vec_full), np.log(M_vec_coarse), ln_M_deb_coarse_arr[i, :])
+                            for i in range(ln_M_deb_coarse_arr.shape[0])
+                        ], axis=0)  # (n_z_coarse, n_M_full)
+                    ln_M_deb_full = np.stack([
+                        np.interp(z_vals_fb, z_coarse, ln_M_deb_coarse_arr[:, j])
+                        for j in range(ln_M_deb_coarse_arr.shape[1])
+                    ], axis=1)  # (n_z, n_M)
+                    self.ln_M_debiased = jnp.asarray(ln_M_deb_full)
+                    '''
 
         elif self.cnc_params["hmf_calc"] == "MiraTitan":
 
@@ -1681,6 +1910,7 @@ class cluster_number_counts:
         self.t_77 = 0.
         self.t_88 = 0.
         self.t_99 = 0.
+
 
     #Computes the cluster abundance across selection observable and redshift
 
