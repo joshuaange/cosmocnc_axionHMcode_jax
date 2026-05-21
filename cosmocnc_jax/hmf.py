@@ -290,6 +290,7 @@ class halo_mass_function:
                         r_s_vec_coarse = r_s_vec
                         delta_char_vec_coarse = delta_char_vec
                         R_vir_vec_coarse = R_vir_vec
+                        M_vec_coarse = M_vec
                     else:
                         Mvir_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
                                                            rho_m, rho_crit_z,
@@ -445,7 +446,7 @@ class halo_mass_function:
 
         if return_profile_params:     
             return M_eval,hmf,{
-                'M_vec'      : M_vec,
+                'M_vec'      : M_vec_coarse,
                 'rho_crit'   : rho_crit_z,
                 'R_vir'      : R_vir_vec_coarse,
                 'r_s'        : r_s_vec_coarse,

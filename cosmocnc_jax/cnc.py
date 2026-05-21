@@ -1798,8 +1798,9 @@ class cluster_number_counts:
                     if (self.cnc_params["n_z"] - 1) not in z_indices_wl:
                         z_indices_wl.append(self.cnc_params["n_z"] - 1)
                     z_coarse = z_vals_fb[z_indices_wl]
-                
-                    M_vec_coarse = np.asarray(self.profile_params["M_vec"][0])
+
+                    M_vec_full = np.exp(np.asarray(self.ln_M) + np.log(1e14))  # (n_full,) — the 1000-point grid
+                    M_vec_coarse = np.asarray(M_vec_full)
                     if "n_mass_points_coarse" in self.cosmology.cosmo_params:
                         M_vec_coarse = np.exp(np.linspace(
                             np.log(M_vec_coarse.min()), np.log(M_vec_coarse.max()),
@@ -1829,7 +1830,6 @@ class cluster_number_counts:
                         jnp.log(M_WL0 * jnp.exp((jnp.log(M_WL_matrix * h / M_WL0) - b_WL0) / b_WLM) / h / 1e14))
                 
                     # Interpolate coarse mass grid → full mass grid if needed
-                    M_vec_full = np.asarray(self.profile_params["M_vec"][0])
                     if "n_mass_points_coarse" in self.cosmology.cosmo_params:
                         ln_M_deb_coarse_arr = np.stack([
                             np.interp(np.log(M_vec_full), np.log(M_vec_coarse), ln_M_deb_coarse_arr[i, :])
@@ -1843,50 +1843,6 @@ class cluster_number_counts:
                     ], axis=1)  # (n_z, n_M)
                 
                     self.ln_M_debiased = jnp.asarray(ln_M_deb_full)
-                    '''
-                    M_vec_coarse = np.exp(self.ln_M) * 1e14
-                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                        M_vec_coarse = np.exp(np.linspace(np.log(min(self.profile_params["M_vec"][0])), np.log(max(self.profile_params["M_vec"][0])), self.cosmology.cosmo_params["n_mass_points_coarse"]))
-                    b_WL0 = self.cosmology.cosmo_params['b_WL0']
-                    b_WLM = self.cosmology.cosmo_params['b_WLM']
-                    h     = self.cosmology.cosmo_params['h']
-                    R_min = self.cosmology.cosmo_params.get('R_min', 0.5)
-                    R_max = self.cosmology.cosmo_params.get('R_max', None)
-                    c_nfw = self.cosmology.cosmo_params.get('c_nfw', 3.5)
-                    M_WL0 = self.cosmology.cosmo_params.get('M_WL0', 2e14)
-                    n_wl_skip = self.cosmology.cosmo_params.get("wl_bias_z_downsample", 1)
-                
-                    z_indices_wl = list(range(0, self.cnc_params["n_z"], n_wl_skip))
-                    if (self.cnc_params["n_z"] - 1) not in z_indices_wl:
-                        z_indices_wl.append(self.cnc_params["n_z"] - 1)
-                    z_coarse = z_vals_fb[z_indices_wl]  # <-- was missing
-                            
-                    ln_M_deb_coarse_list = []
-                    for i in z_indices_wl:
-                        redshift  = float(z_vals_fb[i])
-                        rho_crit_z = float(self.profile_params["rho_crit"][i])
-                        rho_m      = float(self.profile_params["rho_m"][i])  # scalar per z
-                        r_s_arr    = np.asarray(self.profile_params["r_s"][i])
-                        delta_char_arr = np.asarray(self.profile_params["delta_char"][i])
-                        M_WL = func_Bocquet_get_MWL(M_vec_coarse, redshift,
-                                                     r_s_arr, rho_crit_z, delta_char_arr,
-                                                     rho_m, R_min, R_max, c_nfw, h)
-                        M_debiased = M_WL0 * np.exp((np.log(M_WL * h / M_WL0) - b_WL0) / b_WLM) / h
-                        ln_M_deb_coarse_list.append(np.log(M_debiased / 1e14))
-
-                    ln_M_deb_coarse_arr = np.stack(ln_M_deb_coarse_list)  # (n_z_coarse, n_M)
-                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                        M_vec_full = np.asarray(self.profile_params["M_vec"][0])
-                        ln_M_deb_coarse_arr = np.stack([
-                            np.interp(np.log(M_vec_full), np.log(M_vec_coarse), ln_M_deb_coarse_arr[i, :])
-                            for i in range(ln_M_deb_coarse_arr.shape[0])
-                        ], axis=0)  # (n_z_coarse, n_M_full)
-                    ln_M_deb_full = np.stack([
-                        np.interp(z_vals_fb, z_coarse, ln_M_deb_coarse_arr[:, j])
-                        for j in range(ln_M_deb_coarse_arr.shape[1])
-                    ], axis=1)  # (n_z, n_M)
-                    self.ln_M_debiased = jnp.asarray(ln_M_deb_full)
-                    '''
 
         elif self.cnc_params["hmf_calc"] == "MiraTitan":
 
