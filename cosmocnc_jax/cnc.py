@@ -107,7 +107,8 @@ def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, R_min, 
     return M_search[j_best]
 @jax.jit
 def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
-                    delta_char_matrix, rho_m, R_fit_matrix, c_nfw):
+                    delta_char_matrix, rho_m, R_fit_matrix, c_nfw,
+                    Sigma_crit_vec):
     """Vmapped over redshifts. 
     r_s_matrix: (n_z, n_M)
     delta_char_matrix: (n_z, n_M)  
@@ -127,11 +128,14 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
         out = jnp.where(x > 1, jnp.log(x/2) + jnp.arctan( jnp.sqrt(jnp.maximum(x**2-1, 1e-30))) / jnp.sqrt(jnp.maximum(x**2-1, 1e-30)), out)
         return out
 
-    def single_z(r_s_arr, rho_crit_z, delta_char_arr, R_fit):
+    def single_z(r_s_arr, rho_crit_z, delta_char_arr, R_fit, Sigma_crit_z):
         rho_s_arr = delta_char_arr * rho_m
         x_t = R_fit[:, None] / r_s_arr[None, :]  # (n_R, n_M)
-        DS_theory = (4*rho_s_arr[None,:]*r_s_arr[None,:]/x_t**2*_g(x_t)
-                   - 2*rho_s_arr[None,:]*r_s_arr[None,:]/(x_t**2-1)*(1-_f(x_t))).T  # (n_M, n_R)
+        Sigma_t   = (2*rho_s_arr[None,:]*r_s_arr[None,:]
+                     / (x_t**2 - 1) * (1 - _f(x_t)))     # (n_R, n_M)
+        mean_Sig_t = 4*rho_s_arr[None,:]*r_s_arr[None,:] / x_t**2 * _g(x_t)
+        DS_theory = (mean_Sig_t - Sigma_t).T # (n_M, n_R)
+        gt_theory = DS_theory / (Sigma_crit_z - Sigma_t.T)
 
         n_search = 200
         M_search = jnp.exp(jnp.linspace(jnp.log(M_vec_coarse.min()*0.3),
@@ -140,17 +144,24 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
         rs_s = r200c_s / c_nfw
         gc = jnp.log(1+c_nfw) - c_nfw/(1+c_nfw)
         rho_s_s = M_search / (4*jnp.pi*rs_s**3*gc)
-        x_s = R_fit[:, None] / rs_s[None, :]  # (n_R, n_search)
-        DS_model = (4*rho_s_s[None,:]*rs_s[None,:]/x_s**2*_g(x_s)
-                  - 2*rho_s_s[None,:]*rs_s[None,:]/(x_s**2-1)*(1-_f(x_s))).T  # (n_search, n_R)
+        
+        x_s = R_fit[:, None] / rs_s[None, :]              # (n_R, n_search)
+        Sigma_s   = (2*rho_s_s[None,:]*rs_s[None,:]
+                     / (x_s**2 - 1) * (1 - _f(x_s)))
+        mean_Sig_s = 4*rho_s_s[None,:]*rs_s[None,:] / x_s**2 * _g(x_s)
+        DS_s = (mean_Sig_s - Sigma_s).T                    # (n_search, n_R)
+        gt_model = DS_s / (Sigma_crit_z - Sigma_s.T)      # (n_search, n_R)
 
-        norm = jnp.sqrt(jnp.sum(DS_theory**2, axis=1, keepdims=True))
-        resid = jnp.sum((DS_model[None,:,:] - DS_theory[:,None,:])**2, axis=2) / norm**2
+        norm  = jnp.sqrt(jnp.sum(gt_theory**2, axis=1, keepdims=True))  # (n_M, 1)
+        resid = jnp.sum(
+            (gt_model[None,:,:] - gt_theory[:,None,:])**2, axis=2
+        ) / norm**2                                        # (n_M, n_search)
         j_best = jnp.argmin(resid, axis=1)
-        return M_search[j_best]  # (n_M,)
-
-    return jax.vmap(single_z, in_axes=(0, 0, 0, 0))(
-        r_s_matrix, rho_crit_vec, delta_char_matrix, R_fit_matrix)
+        return M_search[j_best]           
+        
+    return jax.vmap(single_z, in_axes=(0, 0, 0, 0, 0))(   # <-- add axis for Sigma_crit
+        r_s_matrix, rho_crit_vec, delta_char_matrix,
+        R_fit_matrix, Sigma_crit_vec)
 
 # =====================================================================
 # Generic factory functions for building JIT-compiled kernels
@@ -1821,9 +1832,17 @@ class cluster_number_counts:
                                                for j in range(len(z_indices_wl))])  # (n_z_wl, n_R)
                 
                     # Single JIT call over all WL redshifts simultaneously → (n_z_wl, n_M_coarse)
+                    Sigma_crit_wl = self.cosmology.cosmo_params.get('Sigma_crit_vec', None)
+                    if Sigma_crit_wl is not None:
+                        Sigma_crit_wl_arr = jnp.array([Sigma_crit_wl[i] for i in z_indices_wl])
+                    else:
+                        print("fallback: infinite Sigma_crit → reduces to DeltaSigma fit")
+                        Sigma_crit_wl_arr = jnp.full(len(z_indices_wl), jnp.inf)
+                
                     M_WL_matrix = _get_MWL_all_z(
                         jnp.asarray(M_vec_coarse), r_s_matrix, rho_crit_vec,
-                        delta_char_matrix, float(rho_m_val), R_fit_matrix, float(c_nfw))
+                        delta_char_matrix, float(rho_m_val), R_fit_matrix, float(c_nfw),
+                        Sigma_crit_wl_arr)
                 
                     # Debias → (n_z_wl, n_M_coarse)
                     ln_M_deb_coarse_arr = np.asarray(
