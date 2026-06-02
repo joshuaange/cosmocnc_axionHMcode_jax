@@ -104,6 +104,8 @@ def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, R_min, 
 
     # Best match per true mass
     j_best = np.argmin(resid, axis=1)
+    at_edge = (j_best == 0) | (j_best == n_search - 1)
+    M_WL = np.where(at_edge, M200c, M_search[j_best])
     return M_search[j_best]
 @jax.jit
 def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
@@ -138,8 +140,8 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
         gt_theory = DS_theory / (Sigma_crit_z - Sigma_t.T)
 
         n_search = 200
-        M_search = jnp.exp(jnp.linspace(jnp.log(M_vec_coarse.min()*0.3),
-                                          jnp.log(M_vec_coarse.max()*3.0), n_search))
+        M_search = jnp.exp(jnp.linspace(jnp.log(M_vec_coarse.min()*0.1),
+                                          jnp.log(M_vec_coarse.max()*10.0), n_search))
         r200c_s = (3*M_search/(4*jnp.pi*200*rho_crit_z))**(1/3)
         rs_s = r200c_s / c_nfw
         gc = jnp.log(1+c_nfw) - c_nfw/(1+c_nfw)
@@ -157,7 +159,9 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
             (gt_model[None,:,:] - gt_theory[:,None,:])**2, axis=2
         ) / norm**2                                        # (n_M, n_search)
         j_best = jnp.argmin(resid, axis=1)
-        return M_search[j_best]           
+        at_edge = (j_best == 0) | (j_best == n_search - 1)
+        M_WL = jnp.where(at_edge, M_vec_coarse, M_search[j_best])
+        return M_WL      
         
     return jax.vmap(single_z, in_axes=(0, 0, 0, 0, 0))(   # <-- add axis for Sigma_crit
         r_s_matrix, rho_crit_vec, delta_char_matrix,
@@ -1847,6 +1851,11 @@ class cluster_number_counts:
                     # Debias → (n_z_wl, n_M_coarse)
                     ln_M_deb_coarse_arr = np.asarray(
                         jnp.log(M_WL0 * jnp.exp((jnp.log(M_WL_matrix * h / M_WL0) - b_WL0) / b_WLM) / h / 1e14))
+                    # Safety: clamp to prevent -inf propagating
+                    ln_M_deb_coarse_arr = np.where(
+                        np.isfinite(ln_M_deb_coarse_arr),
+                        ln_M_deb_coarse_arr,
+                        np.log(M_vec_coarse / 1e14)[None, :])  # fall back to true mass in log units
                 
                     # Interpolate coarse mass grid → full mass grid if needed
                     if "n_mass_points_coarse" in self.cosmology.cosmo_params:
