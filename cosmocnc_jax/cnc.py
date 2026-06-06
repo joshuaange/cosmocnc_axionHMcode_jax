@@ -43,7 +43,7 @@ def _g_nfw(x):
 
 @jax.jit
 def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
-                    delta_char_matrix, rho_m, R_fit_matrix, c_200c_z,
+                    delta_char_matrix, rho_m, R_fit_matrix, c_200c_matrix,
                     Sigma_crit_vec):
     """Vmapped over redshifts. 
     r_s_matrix: (n_z, n_M)
@@ -78,7 +78,7 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
                                           jnp.log(M_vec_coarse.max()*10.0), n_search))
         r200c_s = (3*M_search/(4*jnp.pi*200*rho_crit_z))**(1/3)
 
-        c_200c_search = jnp.interp(M_search, M_vec_coarse, c_200c_z)
+        c_200c_search = jnp.interp(M_search, M_vec_coarse, c_200c_matrix)
         rs_s = r200c_s / c_200c_search
         gc = jnp.log(1+c_200c_search) - c_200c_search/(1+c_200c_search)
         rho_s_s = M_search / (4*jnp.pi*rs_s**3*gc)
@@ -1759,7 +1759,7 @@ class cluster_number_counts:
                     # Stack profile params for JIT call — (n_z_wl, n_M_coarse)
                     r_s_matrix      = jnp.stack([jnp.asarray(self.profile_params["r_s"][i])
                                                   for i in z_indices_wl])
-                    c_200c      = jnp.stack([jnp.asarray(self.profile_params["concentration_200c"][i])
+                    c_200c_matrix      = jnp.stack([jnp.asarray(self.profile_params["concentration_200c"][i])
                                                   for i in z_indices_wl])
                     delta_char_matrix = jnp.stack([jnp.asarray(self.profile_params["delta_char"][i])
                                                     for i in z_indices_wl])
@@ -1782,7 +1782,7 @@ class cluster_number_counts:
                 
                     M_WL_matrix = _get_MWL_all_z(
                         jnp.asarray(M_vec_coarse), r_s_matrix, rho_crit_vec,
-                        delta_char_matrix, float(rho_m_val), R_fit_matrix, c_200c,
+                        delta_char_matrix, float(rho_m_val), R_fit_matrix, c_200c_matrix,
                         Sigma_crit_wl_arr)
                 
                     # Debias → (n_z_wl, n_M_coarse)
