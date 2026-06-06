@@ -40,76 +40,10 @@ def _g_nfw(x):
 
     return jnp.where(x < 1, x_lt_1(x),
            jnp.where(x > 1, x_gt_1(x), 1 + jnp.log(0.5)))
-    
-def func_NFW_DeltaSigma(R, M, rho_crit, c_nfw):
 
-    r_200 = (3.0 * M / (4.0 * jnp.pi * 200.0 * rho_crit))**(1.0 / 3.0)
-    r_s = r_200 / c_nfw
-
-    g_c = jnp.log(1 + c_nfw) - c_nfw / (1 + c_nfw)
-    rho_s = M / (4.0 * jnp.pi * r_s**3 * g_c)
-
-    x = R / r_s
-
-    Sigma = 2.0 * rho_s * r_s / (x**2 - 1.0) * (1.0 - _f_nfw(x))
-    Sigma_bar = 4.0 * rho_s * r_s / x**2 * _g_nfw(x)
-
-    return Sigma_bar - Sigma
-
-def func_Bocquet_get_MWL(M200c, z, r_s_arr, rho_crit, delta_char, rho_m, R_min, R_max_type, c_nfw, h_fid, R_proj_arr_num=100):
-    rho_s_arr = delta_char * rho_m
-    if R_max_type is None:
-        R_max = 3.2 / (1. + z)
-    else:
-        R_max = R_max_type
-    R_fit = np.linspace(R_min, R_max, R_proj_arr_num) / h_fid
-
-    def _f(x):
-        out = np.ones_like(x)
-        m1, m2 = x < 1, x > 1
-        out[m1] = np.arctanh(np.sqrt(np.maximum(1-x[m1]**2, 0))) / np.sqrt(np.maximum(1-x[m1]**2, 1e-30))
-        out[m2] = np.arctan( np.sqrt(np.maximum(x[m2]**2-1, 0))) / np.sqrt(np.maximum(x[m2]**2-1, 1e-30))
-        return out
-
-    def _g(x):
-        out = np.full_like(x, 1 + np.log(0.5))
-        m1, m2 = x < 1, x > 1
-        out[m1] = np.log(x[m1]/2) + np.arctanh(np.sqrt(np.maximum(1-x[m1]**2, 0))) / np.sqrt(np.maximum(1-x[m1]**2, 1e-30))
-        out[m2] = np.log(x[m2]/2) + np.arctan( np.sqrt(np.maximum(x[m2]**2-1, 0))) / np.sqrt(np.maximum(x[m2]**2-1, 1e-30))
-        return out
-
-    # Theory profiles: (n_M, n_R)
-    x_t = R_fit[:, None] / r_s_arr[None, :]
-    DS_theory = (4*rho_s_arr[None,:]*r_s_arr[None,:]/x_t**2*_g(x_t)
-               - 2*rho_s_arr[None,:]*r_s_arr[None,:]/(x_t**2-1)*(1-_f(x_t))).T  # (n_M, n_R)
-
-    # Candidate M_WL grid: (n_search,)
-    n_search = 200
-    M_search = np.exp(np.linspace(np.log(M200c.min()*0.3), np.log(M200c.max()*3.0), n_search))
-    r200c_s = (3*M_search/(4*np.pi*200*rho_crit))**(1/3)
-    rs_s    = r200c_s / c_nfw
-    gc      = np.log(1+c_nfw) - c_nfw/(1+c_nfw)
-    rho_s_s = M_search / (4*np.pi*rs_s**3*gc)
-
-    # Model profiles: (n_search, n_R)
-    x_s = R_fit[:, None] / rs_s[None, :]
-    DS_model = (4*rho_s_s[None,:]*rs_s[None,:]/x_s**2*_g(x_s)
-              - 2*rho_s_s[None,:]*rs_s[None,:]/(x_s**2-1)*(1-_f(x_s))).T  # (n_search, n_R)
-
-    # Normalise by theory amplitude to make residuals scale-independent
-    norm = np.sum(DS_theory**2, axis=1, keepdims=True)**0.5  # (n_M, 1)
-
-    # Residuals: (n_M, n_search) — fully vectorised
-    resid = np.sum((DS_model[None,:,:] - DS_theory[:,None,:])**2, axis=2) / norm**2
-
-    # Best match per true mass
-    j_best = np.argmin(resid, axis=1)
-    at_edge = (j_best == 0) | (j_best == n_search - 1)
-    M_WL = np.where(at_edge, M200c, M_search[j_best])
-    return M_search[j_best]
 @jax.jit
 def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
-                    delta_char_matrix, rho_m, R_fit_matrix, c_nfw,
+                    delta_char_matrix, rho_m, R_fit_matrix, c_200c_z,
                     Sigma_crit_vec):
     """Vmapped over redshifts. 
     r_s_matrix: (n_z, n_M)
@@ -130,7 +64,7 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
         out = jnp.where(x > 1, jnp.log(x/2) + jnp.arctan( jnp.sqrt(jnp.maximum(x**2-1, 1e-30))) / jnp.sqrt(jnp.maximum(x**2-1, 1e-30)), out)
         return out
 
-    def single_z(r_s_arr, rho_crit_z, delta_char_arr, R_fit, Sigma_crit_z):
+    def single_z(r_s_arr, rho_crit_z, delta_char_arr, R_fit, Sigma_crit_z, c_200c_matrix):
         rho_s_arr = delta_char_arr * rho_m
         x_t = R_fit[:, None] / r_s_arr[None, :]  # (n_R, n_M)
         Sigma_t   = (2*rho_s_arr[None,:]*r_s_arr[None,:]
@@ -143,8 +77,10 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
         M_search = jnp.exp(jnp.linspace(jnp.log(M_vec_coarse.min()*0.1),
                                           jnp.log(M_vec_coarse.max()*10.0), n_search))
         r200c_s = (3*M_search/(4*jnp.pi*200*rho_crit_z))**(1/3)
-        rs_s = r200c_s / c_nfw
-        gc = jnp.log(1+c_nfw) - c_nfw/(1+c_nfw)
+
+        c_200c_search = jnp.interp(M_search, M_vec_coarse, c_200c_z)
+        rs_s = r200c_s / c_200c_search
+        gc = jnp.log(1+c_200c_search) - c_200c_search/(1+c_200c_search)
         rho_s_s = M_search / (4*jnp.pi*rs_s**3*gc)
         
         x_s = R_fit[:, None] / rs_s[None, :]              # (n_R, n_search)
@@ -163,9 +99,9 @@ def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
         M_WL = jnp.where(at_edge, M_vec_coarse, M_search[j_best])
         return M_WL      
         
-    return jax.vmap(single_z, in_axes=(0, 0, 0, 0, 0))(   # <-- add axis for Sigma_crit
+    return jax.vmap(single_z, in_axes=(0, 0, 0, 0, 0, 0))(   # <-- add axis for Sigma_crit
         r_s_matrix, rho_crit_vec, delta_char_matrix,
-        R_fit_matrix, Sigma_crit_vec)
+        R_fit_matrix, Sigma_crit_vec, c_200c_matrix)
 
 # =====================================================================
 # Generic factory functions for building JIT-compiled kernels
@@ -1805,7 +1741,6 @@ class cluster_number_counts:
                     h     = self.cosmology.cosmo_params['h']
                     R_min = self.cosmology.cosmo_params.get('R_min', 0.5)
                     R_max = self.cosmology.cosmo_params.get('R_max', None)
-                    c_nfw = self.cosmology.cosmo_params.get('c_nfw', 3.5)
                     M_WL0 = self.cosmology.cosmo_params.get('M_WL0', 2e14)
                     n_wl_skip = self.cosmology.cosmo_params.get("wl_bias_z_downsample", 1)
                 
@@ -1823,6 +1758,8 @@ class cluster_number_counts:
                 
                     # Stack profile params for JIT call — (n_z_wl, n_M_coarse)
                     r_s_matrix      = jnp.stack([jnp.asarray(self.profile_params["r_s"][i])
+                                                  for i in z_indices_wl])
+                    c_200c      = jnp.stack([jnp.asarray(self.profile_params["concentration_200c"][i])
                                                   for i in z_indices_wl])
                     delta_char_matrix = jnp.stack([jnp.asarray(self.profile_params["delta_char"][i])
                                                     for i in z_indices_wl])
@@ -1845,7 +1782,7 @@ class cluster_number_counts:
                 
                     M_WL_matrix = _get_MWL_all_z(
                         jnp.asarray(M_vec_coarse), r_s_matrix, rho_crit_vec,
-                        delta_char_matrix, float(rho_m_val), R_fit_matrix, float(c_nfw),
+                        delta_char_matrix, float(rho_m_val), R_fit_matrix, c_200c,
                         Sigma_crit_wl_arr)
                 
                     # Debias → (n_z_wl, n_M_coarse)

@@ -452,6 +452,8 @@ class halo_mass_function:
                 'r_s'        : r_s_vec_coarse,
                 'delta_char' : delta_char_vec_coarse,
                 'rho_m'      : rho_m  # scalar, same for all M at this z
+                'concentration_virial' : R_vir_vec_coarse/r_s_vec_coarse
+                'concentration_200c'   : R_200c_coarse/r_s_vec_coarse
             }
         return M_eval,hmf
 
