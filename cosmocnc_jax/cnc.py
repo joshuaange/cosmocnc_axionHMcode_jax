@@ -14,95 +14,6 @@ import importlib.util
 import sys
 from itertools import combinations
 
-
-# wl bias
-
-def _f_nfw(x):
-    x = jnp.asarray(x)
-
-    def x_lt_1(x):
-        return 1.0 / jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
-
-    def x_gt_1(x):
-        return 1.0 / jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
-
-    return jnp.where(x < 1, x_lt_1(x),
-           jnp.where(x > 1, x_gt_1(x), 1.0))
-
-def _g_nfw(x):
-    x = jnp.asarray(x)
-
-    def x_lt_1(x):
-        return jnp.log(x/2) + 1/jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
-
-    def x_gt_1(x):
-        return jnp.log(x/2) + 1/jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
-
-    return jnp.where(x < 1, x_lt_1(x),
-           jnp.where(x > 1, x_gt_1(x), 1 + jnp.log(0.5)))
-
-@jax.jit
-def _get_MWL_all_z(M_vec_coarse, r_s_matrix, rho_crit_vec,
-                    delta_char_matrix, rho_m, R_fit_matrix, c_200c_matrix,
-                    Sigma_crit_vec):
-    """Vmapped over redshifts. 
-    r_s_matrix: (n_z, n_M)
-    delta_char_matrix: (n_z, n_M)  
-    rho_crit_vec: (n_z,)
-    R_max_vec: (n_z,)
-    R_fit_matrix: (n_z, n_R)
-    """
-    def _f(x):
-        out = jnp.ones_like(x)
-        out = jnp.where(x < 1, jnp.arctanh(jnp.sqrt(jnp.maximum(1-x**2, 1e-30))) / jnp.sqrt(jnp.maximum(1-x**2, 1e-30)), out)
-        out = jnp.where(x > 1, jnp.arctan( jnp.sqrt(jnp.maximum(x**2-1, 1e-30))) / jnp.sqrt(jnp.maximum(x**2-1, 1e-30)), out)
-        return out
-
-    def _g(x):
-        out = jnp.full_like(x, 1 + jnp.log(0.5))
-        out = jnp.where(x < 1, jnp.log(x/2) + jnp.arctanh(jnp.sqrt(jnp.maximum(1-x**2, 1e-30))) / jnp.sqrt(jnp.maximum(1-x**2, 1e-30)), out)
-        out = jnp.where(x > 1, jnp.log(x/2) + jnp.arctan( jnp.sqrt(jnp.maximum(x**2-1, 1e-30))) / jnp.sqrt(jnp.maximum(x**2-1, 1e-30)), out)
-        return out
-
-    def single_z(r_s_arr, rho_crit_z, delta_char_arr, R_fit, Sigma_crit_z, c_200c_matrix):
-        rho_s_arr = delta_char_arr * rho_m
-        x_t = R_fit[:, None] / r_s_arr[None, :]  # (n_R, n_M)
-        Sigma_t   = (2*rho_s_arr[None,:]*r_s_arr[None,:]
-                     / (x_t**2 - 1) * (1 - _f(x_t)))     # (n_R, n_M)
-        mean_Sig_t = 4*rho_s_arr[None,:]*r_s_arr[None,:] / x_t**2 * _g(x_t)
-        DS_theory = (mean_Sig_t - Sigma_t).T # (n_M, n_R)
-        gt_theory = DS_theory / (Sigma_crit_z - Sigma_t.T)
-
-        n_search = 200
-        M_search = jnp.exp(jnp.linspace(jnp.log(M_vec_coarse.min()*0.1),
-                                          jnp.log(M_vec_coarse.max()*10.0), n_search))
-        r200c_s = (3*M_search/(4*jnp.pi*200*rho_crit_z))**(1/3)
-
-        c_200c_search = jnp.interp(M_search, M_vec_coarse, c_200c_matrix)
-        rs_s = r200c_s / c_200c_search
-        gc = jnp.log(1+c_200c_search) - c_200c_search/(1+c_200c_search)
-        rho_s_s = M_search / (4*jnp.pi*rs_s**3*gc)
-        
-        x_s = R_fit[:, None] / rs_s[None, :]              # (n_R, n_search)
-        Sigma_s   = (2*rho_s_s[None,:]*rs_s[None,:]
-                     / (x_s**2 - 1) * (1 - _f(x_s)))
-        mean_Sig_s = 4*rho_s_s[None,:]*rs_s[None,:] / x_s**2 * _g(x_s)
-        DS_s = (mean_Sig_s - Sigma_s).T                    # (n_search, n_R)
-        gt_model = DS_s / (Sigma_crit_z - Sigma_s.T)      # (n_search, n_R)
-
-        norm  = jnp.sqrt(jnp.sum(gt_theory**2, axis=1, keepdims=True))  # (n_M, 1)
-        resid = jnp.sum(
-            (gt_model[None,:,:] - gt_theory[:,None,:])**2, axis=2
-        ) / norm**2                                        # (n_M, n_search)
-        j_best = jnp.argmin(resid, axis=1)
-        at_edge = (j_best == 0) | (j_best == n_search - 1)
-        M_WL = jnp.where(at_edge, M_vec_coarse, M_search[j_best])
-        return M_WL      
-        
-    return jax.vmap(single_z, in_axes=(0, 0, 0, 0, 0, 0))(   # <-- add axis for Sigma_crit
-        r_s_matrix, rho_crit_vec, delta_char_matrix,
-        R_fit_matrix, Sigma_crit_vec, c_200c_matrix)
-
 # =====================================================================
 # Generic factory functions for building JIT-compiled kernels
 # =====================================================================
@@ -1525,8 +1436,8 @@ class cluster_number_counts:
 
     def get_hmf(self,volume_element=True,return_profile_params=False):
 
-        if (return_profile_params or self.cnc_params["include_wl_bias"]) and not (self.cnc_params["hmf_type"] == "ST_axionHMcode"):
-            print("Returning profile parameters / WL bias is only currently allowed with hmf_type=ST_axionHMcode")
+        if return_profile_params and not (self.cnc_params["hmf_type"] == "ST_axionHMcode"):
+            print("Returning profile parameters is only currently allowed with hmf_type=ST_axionHMcode")
 
         if self.cnc_params["hmf_type"] == "ST_axionHMcode":
             if "G_a_precomputed" in self.cosmo_params:
@@ -1721,7 +1632,7 @@ class cluster_number_counts:
                 z_vals_fb = np.asarray(self.redshift_vec)
                 for i in range(self.cnc_params["n_z"]):
                     if return_profile_params:
-                        ln_M, hmf_eval, profile_params = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=True)
+                        ln_M, hmf_eval, profile_params = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element,return_profile_params=self.cnc_params.get("return_profile_params", False))
                         profile_params_list.append(profile_params)
                     else:
                         ln_M, hmf_eval = self.halo_mass_function.eval_hmf(float(z_vals_fb[i]),log=True,volume_element=volume_element)
@@ -1734,80 +1645,6 @@ class cluster_number_counts:
                         for k in profile_params_list[0].keys()
                     }
                 self.hmf_matrix = jnp.stack(hmf_list)
-                
-                if self.cnc_params["include_wl_bias"]:
-                    b_WL0 = self.cosmology.cosmo_params['b_WL0']
-                    b_WLM = self.cosmology.cosmo_params['b_WLM']
-                    h     = self.cosmology.cosmo_params['h']
-                    R_min = self.cosmology.cosmo_params.get('R_min', 0.5)
-                    R_max = self.cosmology.cosmo_params.get('R_max', None)
-                    M_WL0 = self.cosmology.cosmo_params.get('M_WL0', 2e14)
-                    n_wl_skip = self.cosmology.cosmo_params.get("wl_bias_z_downsample", 1)
-                
-                    z_indices_wl = list(range(0, self.cnc_params["n_z"], n_wl_skip))
-                    if (self.cnc_params["n_z"] - 1) not in z_indices_wl:
-                        z_indices_wl.append(self.cnc_params["n_z"] - 1)
-                    z_coarse = z_vals_fb[z_indices_wl]
-
-                    M_vec_full = np.exp(np.asarray(self.ln_M) + np.log(1e14))  # (n_full,) — the 1000-point grid
-                    M_vec_coarse = np.asarray(M_vec_full)
-                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                        M_vec_coarse = np.exp(np.linspace(
-                            np.log(M_vec_coarse.min()), np.log(M_vec_coarse.max()),
-                            self.cosmology.cosmo_params["n_mass_points_coarse"]))
-                
-                    # Stack profile params for JIT call — (n_z_wl, n_M_coarse)
-                    r_s_matrix      = jnp.stack([jnp.asarray(self.profile_params["r_s"][i])
-                                                  for i in z_indices_wl])
-                    c_200c_matrix      = jnp.stack([jnp.asarray(self.profile_params["concentration_200c"][i])
-                                                  for i in z_indices_wl])
-                    delta_char_matrix = jnp.stack([jnp.asarray(self.profile_params["delta_char"][i])
-                                                    for i in z_indices_wl])
-                    rho_crit_vec    = jnp.array([float(self.profile_params["rho_crit"][i])
-                                                  for i in z_indices_wl])
-                    rho_m_val       = float(self.profile_params["rho_m"][0])
-                
-                    R_max_vec_np = np.array([3.2/(1.+float(z_vals_fb[i])) if R_max is None
-                                              else float(R_max) for i in z_indices_wl])
-                    R_fit_matrix = jnp.stack([jnp.linspace(R_min/h, R_max_vec_np[j]/h, 100)
-                                               for j in range(len(z_indices_wl))])  # (n_z_wl, n_R)
-                
-                    # Single JIT call over all WL redshifts simultaneously → (n_z_wl, n_M_coarse)
-                    Sigma_crit_wl = self.cosmology.cosmo_params.get('Sigma_crit_vec', None)
-                    if Sigma_crit_wl is not None:
-                        Sigma_crit_wl_arr = jnp.array([Sigma_crit_wl[i] for i in z_indices_wl])
-                    else:
-                        print("fallback: infinite Sigma_crit → reduces to DeltaSigma fit")
-                        Sigma_crit_wl_arr = jnp.full(len(z_indices_wl), jnp.inf)
-                
-                    M_WL_matrix = _get_MWL_all_z(
-                        jnp.asarray(M_vec_coarse), r_s_matrix, rho_crit_vec,
-                        delta_char_matrix, float(rho_m_val), R_fit_matrix, c_200c_matrix,
-                        Sigma_crit_wl_arr)
-                
-                    # Debias → (n_z_wl, n_M_coarse)
-                    ln_M_deb_coarse_arr = np.asarray(
-                        jnp.log(M_WL0 * jnp.exp((jnp.log(M_WL_matrix * h / M_WL0) - b_WL0) / b_WLM) / h / 1e14))
-                    # Safety: clamp to prevent -inf propagating
-                    ln_M_deb_coarse_arr = np.where(
-                        np.isfinite(ln_M_deb_coarse_arr),
-                        ln_M_deb_coarse_arr,
-                        np.log(M_vec_coarse / 1e14)[None, :])  # fall back to true mass in log units
-                
-                    # Interpolate coarse mass grid → full mass grid if needed
-                    if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                        ln_M_deb_coarse_arr = np.stack([
-                            np.interp(np.log(M_vec_full), np.log(M_vec_coarse), ln_M_deb_coarse_arr[i, :])
-                            for i in range(ln_M_deb_coarse_arr.shape[0])
-                        ], axis=0)  # (n_z_wl, n_M_full)
-                
-                    # Interpolate coarse z grid → full z grid
-                    ln_M_deb_full = np.stack([
-                        np.interp(z_vals_fb, z_coarse, ln_M_deb_coarse_arr[:, j])
-                        for j in range(ln_M_deb_coarse_arr.shape[1])
-                    ], axis=1)  # (n_z, n_M)
-                
-                    self.ln_M_debiased = jnp.asarray(ln_M_deb_full)
 
         elif self.cnc_params["hmf_calc"] == "MiraTitan":
 
@@ -1832,6 +1669,61 @@ class cluster_number_counts:
         self.t_88 = 0.
         self.t_99 = 0.
 
+    # wl bias
+
+    def get_profile_params_at_clusters(self, z_arr, lnM_arr):
+        """
+        Interpolate NFW profile parameters from the HMF grid to specific
+        (z, lnM) points. Requires get_hmf(return_profile_params=True) to
+        have been called first.
+    
+        Args:
+            z_arr:   (n_cl,) array of cluster redshifts
+            lnM_arr: (n_cl,) array of log(M / 1e14 M_sun) — e.g. posterior means
+    
+        Returns:
+            dict with arrays of shape (n_cl,):
+                'r_s'        [Mpc]
+                'delta_char' [dimensionless]
+                'rho_crit'   [M_sun/Mpc³]
+                'rho_m'      [M_sun/Mpc³]  scalar, same for all
+        """
+        if not hasattr(self, 'profile_params'):
+            raise RuntimeError(
+                "profile_params not available. Call get_hmf(return_profile_params=True) first.")
+    
+        z_grid   = np.asarray(self.redshift_vec)   # (n_z,)
+        M_coarse = np.asarray(self.profile_params['M_vec'])   # (n_M_coarse,) in M_sun
+        lnM_coarse = np.log(M_coarse / 1e14)                  # same units as lnM_arr
+    
+        n_cl = len(z_arr)
+        r_s_out        = np.zeros(n_cl)
+        delta_char_out = np.zeros(n_cl)
+        rho_crit_out   = np.zeros(n_cl)
+    
+        for i in range(n_cl):
+            # Nearest redshift index (profile_params stored on the HMF z-grid)
+            iz = int(np.argmin(np.abs(z_grid - z_arr[i])))
+    
+            r_s_out[i] = np.interp(
+                lnM_arr[i], lnM_coarse,
+                np.asarray(self.profile_params['r_s'][iz]))
+    
+            delta_char_out[i] = np.interp(
+                lnM_arr[i], lnM_coarse,
+                np.asarray(self.profile_params['delta_char'][iz]))
+    
+            rho_crit_out[i] = float(self.profile_params['rho_crit'][iz])
+    
+        rho_m = float(self.profile_params['rho_m'][0])
+    
+        return {
+            'r_s':        r_s_out,
+            'delta_char': delta_char_out,
+            'rho_crit':   rho_crit_out,
+            'rho_m':      rho_m,
+        }
+
 
     #Computes the cluster abundance across selection observable and redshift
 
@@ -1839,7 +1731,7 @@ class cluster_number_counts:
 
         if self.hmf_matrix is None:
 
-            self.get_hmf()
+            self.get_hmf(return_profile_params=self.cnc_params.get("return_profile_params", False))
 
         self.scal_rel_selection = self.scaling_relations[self.cnc_params["obs_select"]]
 
@@ -2868,7 +2760,7 @@ class cluster_number_counts:
 
         if self.hmf_matrix is None:
 
-            self.get_hmf()
+            self.get_hmf(return_profile_params=self.cnc_params.get("return_profile_params", False))
 
         t1 = time.time()
 

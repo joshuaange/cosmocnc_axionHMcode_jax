@@ -52,10 +52,10 @@ def sr_p_so_sim_layer1(x0, _pref_lens, _pref_theta):
     return jnp.exp(x0)
 
 
-def precompute_q_prefactors(E_z, H0, D_A, A_szifi, bias_sz, alpha_szifi):
+def precompute_q_prefactors(E_z, H0, D_A, A_szifi, bias_sz, alpha_szifi, beta_szifi):
     """Pure JAX: precompute q_so_sim prefactors at a single redshift."""
     h70 = H0 / 70.
-    prefactor_logy0 = jnp.log(10.**(A_szifi) * E_z**2 *
+    prefactor_logy0 = jnp.log(10.**(A_szifi) * E_z**beta_szifi *
                                 (bias_sz / 3. * h70)**alpha_szifi / jnp.sqrt(h70))
     prefactor_M_500_to_theta = 6.997 * (H0 / 70.)**(-2./3.) * \
         (bias_sz / 3.)**(1./3.) * E_z**(-2./3.) * (500. / D_A)
@@ -240,7 +240,8 @@ class scaling_relations:
             D_A = other_params["D_A"]
 
             A_szifi = self.params["A_szifi"]
-            self.prefactor_logy0 = jnp.log(10.**(A_szifi)*E_z**2*(self.params["bias_sz"]/3.*h70)**self.params["alpha_szifi"]/jnp.sqrt(h70))
+            beta_szifi = self.params["beta_szifi"]
+            self.prefactor_logy0 = jnp.log(10.**(A_szifi)*E_z**beta_szifi*(self.params["bias_sz"]/3.*h70)**self.params["alpha_szifi"]/jnp.sqrt(h70))
             self.prefactor_M_500_to_theta = 6.997*(H0/70.)**(-2./3.)*(self.params["bias_sz"]/3.)**(1./3.)*E_z**(-2./3.)*(500./D_A)
 
     def eval_scaling_relation(self,x0,layer=0,patch_index=0,other_params=None):
@@ -327,8 +328,9 @@ class scaling_relations:
                 h70 = H0/70.
                 D_A = other_params["D_A"]
                 A_szifi = self.params["A_szifi"]
+                beta_szifi = self.params["beta_szifi"]
 
-                prefactor_logy0 = jnp.log(10.**(A_szifi)*E_z**2*(self.params["bias_sz"]/3.*h70)**self.params["alpha_szifi"]/jnp.sqrt(h70))
+                prefactor_logy0 = jnp.log(10.**(A_szifi)*E_z**beta_szifi*(self.params["bias_sz"]/3.*h70)**self.params["alpha_szifi"]/jnp.sqrt(h70))
                 log_y0 = prefactor_logy0 + x0*self.params["alpha_szifi"]
 
                 prefactor_M_500_to_theta = 6.997*(H0/70.)**(-2./3.)*(self.params["bias_sz"]/3.)**(1./3.)*E_z**(-2./3.)*(500./D_A)
@@ -475,7 +477,7 @@ class scaling_relations:
         """Return in_axes for vmapping the prefactor function over redshift."""
         obs = self.observable
         if obs == "q_so_sim":
-            return (0, None, 0, None, None, None)
+            return (0, None, 0, None, None, None, None)
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
             return (0, None, 0, None, 0, 0, None, None)
         raise ValueError(f"No prefactor vmap axes for observable={obs}")
@@ -493,7 +495,8 @@ class scaling_relations:
                     cosmo_quantities["D_A"],
                     jnp.float64(sr_params["A_szifi"]),
                     jnp.float64(sr_params["bias_sz"]),
-                    jnp.float64(sr_params["alpha_szifi"]))
+                    jnp.float64(sr_params["alpha_szifi"]),
+                    jnp.float64(sr_params["beta_szifi"]))
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
             return (cosmo_quantities["E_z"], cosmo_quantities["H0"],
                     cosmo_quantities["D_A"], cosmo_quantities["D_CMB"],
@@ -522,9 +525,9 @@ class scaling_relations:
         obs = self.observable
         if obs == "q_so_sim":
             def fn(E_z, D_A, D_l_CMB, rho_c, H0, D_CMB, gamma, z_val,
-                   A_szifi, bias_sz, alpha_szifi):
+                   A_szifi, bias_sz, alpha_szifi, beta_szifi):
                 return precompute_q_prefactors(E_z, H0, D_A,
-                                                A_szifi, bias_sz, alpha_szifi)
+                                                A_szifi, bias_sz, alpha_szifi, beta_szifi)
             return fn
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
             def fn(E_z, D_A, D_l_CMB, rho_c, H0, D_CMB, gamma, z_val,
@@ -544,7 +547,8 @@ class scaling_relations:
         if obs == "q_so_sim":
             return (jnp.float64(sr_params["A_szifi"]),
                     jnp.float64(sr_params["bias_sz"]),
-                    jnp.float64(sr_params["alpha_szifi"]))
+                    jnp.float64(sr_params["alpha_szifi"]),
+                    jnp.float64(sr_params["beta_szifi"]))
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
             return (jnp.float64(sr_params["bias_cmblens"]),)
         return ()
@@ -553,7 +557,7 @@ class scaling_relations:
         """Return number of SR params passed to the unified prefactor function."""
         obs = self.observable
         if obs == "q_so_sim":
-            return 3
+            return 4
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
             return 1
         return 0

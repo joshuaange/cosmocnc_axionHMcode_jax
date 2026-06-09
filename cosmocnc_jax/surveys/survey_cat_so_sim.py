@@ -1,5 +1,6 @@
 import numpy as np
 import cosmocnc_jax
+import pickle
 
 class cluster_catalogue_survey:
 
@@ -84,3 +85,21 @@ class cluster_catalogue_survey:
                         f_v = 0.
 
                     self.cnc_params["f_true_validated"] = f_v
+
+        else:
+            # this is just using my catalog structure, should not be generalized beyond
+            with open(self.catalogue_name, "rb") as f:
+                catalogue = pickle.load(f)
+
+            self.catalogue = {}
+            self.catalogue["q_so_sim"] = catalogue["q_obs"]
+            self.catalogue["z"] = catalogue["z"]
+            self.catalogue["z_std"] = np.zeros(len(self.catalogue["z"]))*1e-2
+            self.M = catalogue["M200c_true"]
+
+            self.catalogue_patch = {
+                "q_so_sim" : np.zeros(len(catalogue["z"]), dtype=int),
+            }
+     
+            self.stacked_data_labels = []
+            self.stacked_data        = {}

@@ -21,6 +21,25 @@ TINKER08_a = jnp.array([1.47,1.52,1.56,1.61,1.87,2.13,2.30,2.53,2.66], dtype=jnp
 TINKER08_b = jnp.array([2.57,2.25,2.05,1.87,1.59,1.51,1.46,1.44,1.41], dtype=jnp.float64)
 TINKER08_c = jnp.array([1.19,1.27,1.34,1.45,1.58,1.80,1.97,2.24,2.44], dtype=jnp.float64)
 
+def _smooth_log_jacobian(M200c_coarse, Mvir_coarse):
+    """
+    Compute d(lnMvir)/d(lnM200c) using central differences in log-log space.
+    Uses forward/backward at endpoints but with larger stencil to avoid
+    the one-sided difference instability of np.gradient.
+    """
+    n = len(M200c_coarse)
+    lnM200c = np.log(M200c_coarse)
+    lnMvir  = np.log(Mvir_coarse)
+    result  = np.zeros(n)
+
+    # Central differences for interior points
+    result[1:-1] = (lnMvir[2:] - lnMvir[:-2]) / (lnM200c[2:] - lnM200c[:-2])
+
+    # Forward/backward at endpoints
+    result[0]  = (lnMvir[1]  - lnMvir[0])  / (lnM200c[1]  - lnM200c[0])
+    result[-1] = (lnMvir[-1] - lnMvir[-2]) / (lnM200c[-1] - lnM200c[-2])
+
+    return result
 
 # =====================================================================
 # Pure JAX functions for JIT compilation
@@ -224,104 +243,117 @@ class halo_mass_function:
         if self.hmf_calc == "cnc":
 
             if self.hmf_type == "ST_axionHMcode":
-
+            
                 if self.mass_definition == "200c":
                     Del = 200
                 elif self.mass_definition == "500c":
                     Del = 500
                 else:
                     print("ST_axionHMcode not yet updated to work with non-200c mass definitions")
-                # note: axionHMcode uses h units
-
+            
                 E_z = lambda z: self.cosmology.background_cosmology.H(z).value / (100. * self.h)
-
-                # 200c
+            
                 Om0 = self.cosmology.cosmo_params["Om0"]
-                rho_crit_z = self.rho_c_0 * E_z(redshift)**2 # Msol/Mpc^3
-                R_200c = (3. * M_vec / (4. * np.pi * rho_crit_z* Del))**(1./3.) # Mpc
-                # virial
-                rho_m = self.rho_c_0 * Om0 # Msol/Mpc^3
-                #G_a = func_axionHMcode_D_z_unnorm_int(0., Om0, E_z)_
-                #g_a = func_axionHMcode_D_z_unnorm(redshift, Om0, E_z)*(1+redshift)
-                g_a = np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full) * self.cosmology.normalisation_cached * (1 + redshift)
+                rho_crit_z = self.rho_c_0 * E_z(redshift)**2        # Msol/Mpc^3
+                R_200c = (3. * M_vec / (4. * np.pi * rho_crit_z * Del))**(1./3.)   # Mpc
+                rho_m  = self.rho_c_0 * Om0                          # Msol/Mpc^3
+            
+                g_a = (np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full)
+                       * self.cosmology.normalisation_cached * (1 + redshift))
                 G_a = self.cosmology.G_a_cached
-                Delta_vir = func_axionHMcode_Delta_vir(redshift, Om0, G_a, E_z, g_a) # note: wrt mean at z=0
-
-                c_min = 5.196 # should turn this into a parameter
-                k, ps = self.cosmology.power_spectrum.get_linear_power_spectrum(redshift)
+                Delta_vir = func_axionHMcode_Delta_vir(redshift, Om0, G_a, E_z, g_a)
+            
+                c_min   = 5.196
+                k, ps   = self.cosmology.power_spectrum.get_linear_power_spectrum(redshift)
                 sigma_r = sigma_R((k, ps), cosmology=self.cosmology)
                 sigma_r.get_derivative(type_deriv=self.type_deriv)
-                #normalisation = func_axionHMcode_D_z_unnorm(0., Om0, E_z)
-                delta_c   = func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a)
-                # Solve on coarse grid
+                delta_c = func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a)
+            
                 if "n_mass_points_coarse" in self.cosmology.cosmo_params:
-                    n_coarse = self.cosmology.cosmo_params["n_mass_points_coarse"]
-                    M_vec_coarse = np.exp(np.linspace(np.log(M_vec.min()), np.log(M_vec.max()), n_coarse))
+                    n_coarse     = self.cosmology.cosmo_params["n_mass_points_coarse"]
+                    M_vec_coarse = np.exp(np.linspace(np.log(M_vec.min()),
+                                                       np.log(M_vec.max()), n_coarse))
                     R_200c_coarse = (3. * M_vec_coarse / (4. * np.pi * rho_crit_z * Del))**(1./3.)
-
+            
                     if return_profile_params:
-                        Mvir_coarse, R_vir_vec_coarse, r_s_vec_coarse, delta_char_vec_coarse = find_M_vir_from_M_200c(M_vec_coarse, R_200c_coarse, 
-                                                           rho_m, rho_crit_z,
-                                                           Delta_vir, c_min, redshift, Om0, sigma_r,
-                                                           self.cosmology.normalisation_cached, delta_c, E_z,
-                                                           self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                                           min_factor = 0.1, max_factor=20, return_profile_params=True)
-                        Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(Mvir_coarse))),\
-                                                                       np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(R_vir_vec_coarse))),\
-                                                                       np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(r_s_vec_coarse))),\
-                                                                       np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(delta_char_vec_coarse)))
-                        R_vir_vec_coarse = (3. * Mvir_coarse / (4. * np.pi * rho_m * Delta_vir))**(1./3.) # Mpc/h
+                        Mvir_coarse, R_vir_vec_coarse, r_s_vec_coarse, delta_char_vec_coarse = \
+                            find_M_vir_from_M_200c(
+                                M_vec_coarse, R_200c_coarse, rho_m, rho_crit_z,
+                                Delta_vir, c_min, redshift, Om0, sigma_r,
+                                self.cosmology.normalisation_cached, delta_c, E_z,
+                                self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
+                                min_factor=0.1, max_factor=20, return_profile_params=True)
+                        R_vir_vec_coarse = (3. * Mvir_coarse
+                                            / (4. * np.pi * rho_m * Delta_vir))**(1./3.)
                     else:
-                        Mvir_coarse = find_M_vir_from_M_200c(M_vec_coarse, R_200c_coarse, 
-                                                           rho_m, rho_crit_z,
-                                                           Delta_vir, c_min, redshift, Om0, sigma_r,
-                                                           self.cosmology.normalisation_cached, delta_c, E_z,
-                                                           self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                                           min_factor = 0.1, max_factor=20)
-                        Mvir_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse), np.log(Mvir_coarse)))
+                        Mvir_coarse = find_M_vir_from_M_200c(
+                            M_vec_coarse, R_200c_coarse, rho_m, rho_crit_z,
+                            Delta_vir, c_min, redshift, Om0, sigma_r,
+                            self.cosmology.normalisation_cached, delta_c, E_z,
+                            self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
+                            min_factor=0.1, max_factor=20)
+            
+                    dlnMvir_dlnM200c_coarse = _smooth_log_jacobian(M_vec_coarse, Mvir_coarse)
+                    dlnMvir_dlnM200c_full   = np.interp(np.log(M_vec), np.log(M_vec_coarse),
+                                                          dlnMvir_dlnM200c_coarse)
+                    Mvir_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse),
+                                                 np.log(Mvir_coarse)))
+                    dMvir_dM200c = (Mvir_vec / M_vec) * dlnMvir_dlnM200c_full
+            
+                    if return_profile_params:
+                        r_s_vec        = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse),
+                                                           np.log(r_s_vec_coarse)))
+                        delta_char_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse),
+                                                           np.log(delta_char_vec_coarse)))
+            
                 else:
                     if return_profile_params:
-                        Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
-                                                                       rho_m, rho_crit_z,
-                                                                       Delta_vir, c_min, redshift, Om0, sigma_r,
-                                                                       self.cosmology.normalisation_cached, delta_c, E_z,
-                                                                       self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                                                       min_factor = 0.1, max_factor=20, return_profile_params=True)
-                        r_s_vec_coarse = r_s_vec
+                        Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = find_M_vir_from_M_200c(
+                            M_vec, R_200c, rho_m, rho_crit_z,
+                            Delta_vir, c_min, redshift, Om0, sigma_r,
+                            self.cosmology.normalisation_cached, delta_c, E_z,
+                            self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
+                            min_factor=0.1, max_factor=20, return_profile_params=True)
+                        r_s_vec_coarse        = r_s_vec
                         delta_char_vec_coarse = delta_char_vec
-                        R_vir_vec_coarse = R_vir_vec
-                        M_vec_coarse = M_vec
+                        R_vir_vec_coarse      = R_vir_vec
+                        M_vec_coarse          = M_vec
                     else:
-                        Mvir_vec = find_M_vir_from_M_200c(M_vec, R_200c, 
-                                                           rho_m, rho_crit_z,
-                                                           Delta_vir, c_min, redshift, Om0, sigma_r,
-                                                           self.cosmology.normalisation_cached, delta_c, E_z,
-                                                           self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                                           min_factor = 0.1, max_factor=20)
-                #Mvir_vec_with_h_units = Mvir_vec*self.h # Msol/h
-                #R_vir = (3. * Mvir_vec / (4. * np.pi * rho_m * Delta_vir))**(1./3.) # Mpc/h
-                #R_vir_with_h_units = (3. * Mvir_vec_with_h_units / (4. * np.pi * rho_m_with_h_units * Delta_vir))**(1./3.) # Mpc/h
+                        Mvir_vec = find_M_vir_from_M_200c(
+                            M_vec, R_200c, rho_m, rho_crit_z,
+                            Delta_vir, c_min, redshift, Om0, sigma_r,
+                            self.cosmology.normalisation_cached, delta_c, E_z,
+                            self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
+                            min_factor=0.1, max_factor=20)
+            
+                    dMvir_dM200c = np.gradient(Mvir_vec, M_vec)
+            
+                # HMF in M_vir then Jacobian to M_200c
                 (sigma, dsigmadR_vir) = sigma_r.get_sigma_M(Mvir_vec, rho_m, get_deriv=True)
-                R_lagrangian = sigma_r.R_eval   # the R that get_sigma_M actually used
-                dM_dR_lagrangian = 4. * np.pi * rho_m * R_lagrangian**2
-                dlnsigma2_dlnMvir = (Mvir_vec / sigma**2) * (2. * sigma * dsigmadR_vir) / dM_dR_lagrangian
-
-                nu = delta_c / sigma
-                p_st = 0.3
-                q_st = 0.707
-                A_st = np.sqrt(2.*q_st)/(np.sqrt(np.pi) + Gamma(0.5-p_st)/2**p_st)  # A ~ 0.2161
-                func_sheth_tormen = A_st * nu * (1. + (q_st ** 0.5 * nu) ** (-2. * p_st)) * np.exp((-q_st * nu ** 2.) / 2.)
-
-                hmf_vir = 0.5 * (rho_m / Mvir_vec**2) * func_sheth_tormen * np.abs(dlnsigma2_dlnMvir) # 1/M_vir dn/dlnM_vir = dn/dM_vir
-                hmf = hmf_vir * np.gradient(Mvir_vec, M_vec) # dn/dM200c
-                    
+                R_lagrangian      = sigma_r.R_eval
+                dM_dR_lagrangian  = 4. * np.pi * rho_m * R_lagrangian**2
+                dlnsigma2_dlnMvir = ((Mvir_vec / sigma**2)
+                                      * (2. * sigma * dsigmadR_vir) / dM_dR_lagrangian)
+            
+                nu     = delta_c / sigma
+                p_st   = 0.3
+                q_st   = 0.707
+                A_st   = np.sqrt(2.*q_st) / (np.sqrt(np.pi) + Gamma(0.5 - p_st) / 2**p_st)
+                func_sheth_tormen = (A_st * nu
+                                      * (1. + (q_st**0.5 * nu)**(-2.*p_st))
+                                      * np.exp(-q_st * nu**2 / 2.))
+            
+                hmf_vir = (0.5 * (rho_m / Mvir_vec**2)
+                            * func_sheth_tormen * np.abs(dlnsigma2_dlnMvir))
+            
+                hmf    = hmf_vir * dMvir_dM200c
                 M_eval = M_vec
-
+            
                 hmf    = hmf * 1e14
                 M_eval = M_eval / 1e14
-
+            
                 if log == True:
-                    hmf    = hmf * M_eval 
+                    hmf    = hmf * M_eval
                     M_eval = np.log(M_eval)
 
             if self.hmf_type == "Tinker08":
