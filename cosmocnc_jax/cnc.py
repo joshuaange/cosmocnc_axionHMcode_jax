@@ -1641,8 +1641,15 @@ class cluster_number_counts:
                 self.ln_M = ln_M
                 if return_profile_params:
                     self.profile_params = {
-                        k: jnp.stack([d[k] for d in profile_params_list])
-                        for k in profile_params_list[0].keys()
+                        'M_vec'      : np.asarray(profile_params_list[0]['M_vec']),  # same for all z
+                        'rho_m'      : np.array([d['rho_m']       for d in profile_params_list]),
+                        'rho_crit'   : np.array([d['rho_crit']     for d in profile_params_list]),
+                        'r_s'        : np.vstack([np.asarray(d['r_s']).ravel()
+                                                   for d in profile_params_list]),        # (n_z, n_M_coarse)
+                        'delta_char' : np.vstack([np.asarray(d['delta_char']).ravel()
+                                                   for d in profile_params_list]),        # (n_z, n_M_coarse)
+                        'R_vir'      : np.vstack([np.asarray(d['R_vir']).ravel()
+                                                   for d in profile_params_list]),
                     }
                 self.hmf_matrix = jnp.stack(hmf_list)
 
@@ -1669,8 +1676,6 @@ class cluster_number_counts:
         self.t_88 = 0.
         self.t_99 = 0.
 
-    # wl bias
-
     def get_profile_params_at_clusters(self, z_arr, lnM_arr):
         """
         Interpolate NFW profile parameters from the HMF grid to specific
@@ -1695,32 +1700,34 @@ class cluster_number_counts:
         z_grid   = np.asarray(self.redshift_vec)   # (n_z,)
         M_coarse = np.asarray(self.profile_params['M_vec'])   # (n_M_coarse,) in M_sun
         lnM_coarse = np.log(M_coarse / 1e14)                  # same units as lnM_arr
-    
-        n_cl = len(z_arr)
-        r_s_out        = np.zeros(n_cl)
-        delta_char_out = np.zeros(n_cl)
-        rho_crit_out   = np.zeros(n_cl)
+
+        n_cl, n_mass = lnM_arr.shape
+
+        r_s_out        = np.zeros((n_cl, n_mass))
+        delta_char_out = np.zeros((n_cl, n_mass))
     
         for i in range(n_cl):
-            # Nearest redshift index (profile_params stored on the HMF z-grid)
+    
             iz = int(np.argmin(np.abs(z_grid - z_arr[i])))
     
             r_s_out[i] = np.interp(
-                lnM_arr[i], lnM_coarse,
-                np.asarray(self.profile_params['r_s'][iz]))
+                lnM_arr[i],
+                lnM_coarse,
+                self.profile_params["r_s"][iz]
+            )
     
             delta_char_out[i] = np.interp(
-                lnM_arr[i], lnM_coarse,
-                np.asarray(self.profile_params['delta_char'][iz]))
-    
-            rho_crit_out[i] = float(self.profile_params['rho_crit'][iz])
+                lnM_arr[i],
+                lnM_coarse,
+                self.profile_params["delta_char"][iz]
+            )
+
     
         rho_m = float(self.profile_params['rho_m'][0])
     
         return {
             'r_s':        r_s_out,
             'delta_char': delta_char_out,
-            'rho_crit':   rho_crit_out,
             'rho_m':      rho_m,
         }
 
