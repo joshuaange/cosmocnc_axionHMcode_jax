@@ -1649,7 +1649,7 @@ class cluster_number_counts:
                         'delta_char' : np.vstack([np.asarray(d['delta_char']).ravel()
                                                    for d in profile_params_list]),        # (n_z, n_M_coarse)
                         'R_vir'      : np.vstack([np.asarray(d['R_vir']).ravel()
-                                                   for d in profile_params_list]),
+                                                   for d in profile_params_list])
                     }
                 self.hmf_matrix = jnp.stack(hmf_list)
 

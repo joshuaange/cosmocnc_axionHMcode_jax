@@ -256,7 +256,7 @@ class halo_mass_function:
                 Om0 = self.cosmology.cosmo_params["Om0"]
                 rho_crit_z = self.rho_c_0 * E_z(redshift)**2        # Msol/Mpc^3
                 R_200c = (3. * M_vec / (4. * np.pi * rho_crit_z * Del))**(1./3.)   # Mpc
-                rho_m  = self.rho_c_0 * Om0                          # Msol/Mpc^3
+                rho_m  = self.rho_c_0 * Om0                          # Msol/Mpc^3, mean matter density at z=0
             
                 g_a = (np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full)
                        * self.cosmology.normalisation_cached * (1 + redshift))
@@ -326,7 +326,7 @@ class halo_mass_function:
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
                             min_factor=0.1, max_factor=20)
             
-                    dMvir_dM200c = np.gradient(Mvir_vec, M_vec)
+                    dMvir_dM200c = (np.asarray(Mvir_vec) / np.asarray(M_vec)) * _smooth_log_jacobian(np.asarray(M_vec), np.asarray(Mvir_vec))
             
                 # HMF in M_vir then Jacobian to M_200c
                 (sigma, dsigmadR_vir) = sigma_r.get_sigma_M(Mvir_vec, rho_m, get_deriv=True)
@@ -699,8 +699,6 @@ def func_axionHMcode_Delta_vir(redshift, Om0, G_a, E_z, g_a, version='dome'):
         return 177.7 * ( 1 + f_1*np.log10(Omega_m_z)**alpha_1 + f_2*np.log10(Omega_m_z)**alpha_2)
 
 
-    return f
-
 def func_axionHMcode_z_formation(redshift, Mvir_with_h_units, rho_m_with_h_units,
                                  Om0, sigma_r, normalisation, delta_c, E_z, f=0.01):
     def solve_single(M_single):
@@ -776,116 +774,7 @@ def func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a, version='dome'):
         return 1.686 *(1-0.041*f_frac)* ( 1 + f_1*np.log10(Omega_m_z)**alpha_1 + f_2*np.log10(Omega_m_z)**alpha_2)
     else:
         return 1.686 * ( 1 + f_1*np.log10(Omega_m_z)**alpha_1 + f_2*np.log10(Omega_m_z)**alpha_2)
-'''
-def find_M_vir_from_M_200c(M_vec_with_h, R_200c_with_h, rho_m_with_h, rho_crit_z_with_h,
-                            Delta_vir, c_min, redshift, Om0, sigma_r, 
-                            normalisation, delta_c, E_z, D_grid_z_full, D_grid_full,
-                            min_factor = 0.5, max_factor=10, return_profile_params=False):
-    def g(x):
-        # NFW enclosed mass shape function
-        return np.log(1. + x) - x / (1. + x)
-    M_vir_grid = np.exp(np.linspace(
-        np.log(min_factor * M_vec_with_h.min()),
-        np.log(max_factor * M_vec_with_h.max()),
-        300))
-    z_formation_interp = func_axionHMcode_z_formation_fast(
-        redshift, M_vir_grid, rho_m_with_h, Om0,
-        sigma_r, normalisation, delta_c, E_z, 
-        D_grid_z_full, D_grid_full, f=0.01)
 
-    def residual_single(log_Mvir, M200c, R200c):
-        Mvir = np.exp(log_Mvir)
-
-        # concentration from axionHMcode c-M relation
-        #z_f = func_axionHMcode_z_formation(redshift, Mvir, rho_m_with_h, Om0, G_a, sigma_r, normalisation, delta_c, f=0.01)
-        z_f = z_formation_interp(Mvir)
-        concentration = c_min * (1. + z_f) / (1. + redshift)
-
-        # virial radius from M_vir definition (w.r.t. mean density at z=0)
-        R_vir = (3. * Mvir / (4. * np.pi * rho_m_with_h * Delta_vir))**(1./3.)
-        r_s   = R_vir / concentration
-
-        # NFW characteristic density (delta_char * rho_mean)
-        # rho(r) = delta_char * rho_m / ((r/r_s)(1+r/r_s)^2)
-        # such that M(<R_vir) = M_vir by construction
-        delta_char = Delta_vir * concentration**3 / (3. * g(concentration))
-
-        # enclosed mass at R_200c
-        x_200c = R200c / r_s
-        M_enc  = 4. * np.pi * delta_char * rho_m_with_h * r_s**3 * g(x_200c)
-
-        return M_enc - M200c
-
-    def solve_single(M200c, R200c):
-        # Bracket in log(M_vir): M_vir is usually within factor ~2 of M_200c
-        log_lo = np.log(min_factor * M200c)
-        log_hi = np.log(max_factor * M200c)
-
-        # Check bracket is valid
-        f_lo = residual_single(log_lo, M200c, R200c)
-        f_hi = residual_single(log_hi, M200c, R200c)
-
-        if f_lo * f_hi > 0.:
-            print(f"Bracket failed for M200c {M200c}. Falling back to constant-ratio approximation")
-            ratio = (200. * rho_crit_z_with_h / (Delta_vir * rho_m_with_h))
-            return M200c * ratio
-
-        log_Mvir = brentq(residual_single, log_lo, log_hi,
-                          args=(M200c, R200c), xtol=1e-8, rtol=1e-6)
-        #return np.exp(log_Mvir)
-        Mvir = np.exp(log_Mvir)
-
-        if return_profile_params:
-            # recompute profile quantities at solution
-            z_f        = z_formation_interp(Mvir)
-            conc       = c_min * (1. + z_f) / (1. + redshift)
-            R_vir_sol  = (3. * Mvir / (4. * np.pi * rho_m_with_h * Delta_vir))**(1./3.)
-            r_s_sol    = R_vir_sol / conc
-            delta_char_sol = Delta_vir * conc**3 / (3. * g(conc))
-
-            return Mvir, R_vir_sol, r_s_sol, delta_char_sol
-
-        return Mvir
-
-    #solve_vec = np.vectorize(solve_single)
-    #return solve_vec(M_vec_with_h, R_200c_with_h)
-    #return np.vectorize(solve_single)(M_vec_with_h, R_200c_with_h)
-    if return_profile_params:
-        Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = np.vectorize(
-            solve_single, otypes=[float, float, float, float]
-        )(M_vec_with_h, R_200c_with_h)
-        return Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec
-    else:
-        return np.vectorize(solve_single)(M_vec_with_h, R_200c_with_h)
-'''
-@functools.partial(jax.jit, static_argnums=())
-def _find_M_vir_jit(log_lo, log_hi, R_200c, rho_m, Delta_vir, c_min,
-                     redshift, log_M_vir_grid, z_f_grid, n_iter=60):
-    """JIT-compiled bisection for M_vir given M_200c array."""
-    def g(x):
-        return jnp.log(1. + x) - x / (1. + x)
-
-    def body(carry, _):
-        lo, hi = carry
-        mid = 0.5 * (lo + hi)
-        Mvir = jnp.exp(mid)
-        z_f = jnp.interp(mid, log_M_vir_grid, z_f_grid)
-        conc = c_min * (1. + z_f) / (1. + redshift)
-        R_vir = (3. * Mvir / (4. * jnp.pi * rho_m * Delta_vir))**(1./3.)
-        r_s = R_vir / conc
-        delta_char = Delta_vir * conc**3 / (3. * g(conc))
-        x_200c = R_200c / r_s
-        M_enc = 4. * jnp.pi * delta_char * rho_m * r_s**3 * g(x_200c)
-        lo = jnp.where(M_enc < jnp.exp(log_lo + log_hi - mid), mid, lo)  # wrong
-        return (lo, hi), None
-
-    def body_fixed(carry, _):
-        lo, hi, M200c_arr = carry
-        mid = 0.5 * (lo + hi)
-        Mvir = jnp.exp(mid)
-        z_f = jnp.interp(mid, log_M_vir_grid, z_f_grid)  # scalar per mass point — need vmap
-        ...
-        
 @jax.jit
 def _bisect_single(log_lo, log_hi, M200c, R200c, rho_m, Delta_vir, c_min,
                    redshift, log_M_vir_grid, z_f_grid):
@@ -901,6 +790,7 @@ def _bisect_single(log_lo, log_hi, M200c, R200c, rho_m, Delta_vir, c_min,
         R_vir = (3. * Mvir / (4. * jnp.pi * rho_m * Delta_vir))**(1./3.)
         r_s = R_vir / conc
         delta_char = Delta_vir * conc**3 / (3. * g(conc))
+        # NFW enclosed mass uses rho_m (mean matter density at z=0), consistent with Delta_vir definition
         x_200c = R200c / r_s
         M_enc = 4. * jnp.pi * delta_char * rho_m * r_s**3 * g(x_200c)
         lo = jnp.where(M_enc < M200c, mid, lo)

@@ -92,7 +92,7 @@ class cluster_catalogue_survey:
                 catalogue = pickle.load(f)
 
             self.catalogue = {}
-            self.catalogue["q_so_sim"] = catalogue["q_obs"]
+            self.catalogue["q_so_sim"] = catalogue["q_mean"]
             self.catalogue["z"] = catalogue["z"]
             self.catalogue["z_std"] = np.zeros(len(self.catalogue["z"]))*1e-2
             self.M = catalogue["M200c_true"]
