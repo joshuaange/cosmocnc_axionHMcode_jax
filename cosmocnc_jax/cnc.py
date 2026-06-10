@@ -1705,6 +1705,7 @@ class cluster_number_counts:
 
         r_s_out        = np.zeros((n_cl, n_mass))
         delta_char_out = np.zeros((n_cl, n_mass))
+        r_vir_out = np.zeros((n_cl, n_mass))
     
         for i in range(n_cl):
     
@@ -1722,6 +1723,8 @@ class cluster_number_counts:
                 self.profile_params["delta_char"][iz]
             )
 
+            r_vir_out[i] = np.interp(lnM_arr[i], lnM_coarse, self.profile_params["R_vir"][iz])
+
     
         rho_m = float(self.profile_params['rho_m'][0])
     
@@ -1729,6 +1732,7 @@ class cluster_number_counts:
             'r_s':        r_s_out,
             'delta_char': delta_char_out,
             'rho_m':      rho_m,
+            'R_vir':      r_vir_out,
         }
 
 
