@@ -2510,21 +2510,9 @@ class cluster_number_counts:
                 c_200c = profile["concentration_200c"]
                 Sigma_crit_vec_h = self.cosmo_params["Sigma_crit_vec"][iz_wl] / h_fid
     
-                # These replace the catalogue-stored values with fresh cosmology-derived ones
                 self.scaling_relations["gt"]._rho_crit_clusters  = (rho_crit_h)          # (n_bc,) Msol/h/(Mpc/h)³
                 self.scaling_relations["gt"]._Sigma_crit_clusters = (Sigma_crit_vec_h)          # (n_bc,) Msol/h/(Mpc/h)²
                 self.scaling_relations["gt"]._c_200c_clusters = (c_200c)        
-
-                # DIAGNOSTICS
-                pc_test = self.scaling_relations["gt"].get_layer_sr_params_per_cluster(0, self.scal_rel_params)
-                print(f"n_profile_pc items: {len(pc_test)}")
-                for i, arr in enumerate(pc_test):
-                    if arr is None:
-                        print(f"  pc[{i}] = None  <-- THIS IS THE BUG")
-                    else:
-                        print(f"  pc[{i}] shape={np.asarray(arr).shape}, "
-                              f"min={np.asarray(arr).min():.3g}, max={np.asarray(arr).max():.3g}, "
-                              f"nans={np.any(np.isnan(np.asarray(arr)))}")
 
                 if hasattr(self, '_pc_slice_cache'):
                     self._pc_slice_cache.pop(('gt', 0), None)
