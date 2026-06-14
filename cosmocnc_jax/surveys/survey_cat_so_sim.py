@@ -1,6 +1,7 @@
 import numpy as np
 import cosmocnc_jax
 import pickle
+import jax.numpy as jnp
 
 class cluster_catalogue_survey:
 
@@ -92,13 +93,34 @@ class cluster_catalogue_survey:
                 catalogue = pickle.load(f)
 
             self.catalogue = {}
-            self.catalogue["q_so_sim"] = catalogue["q_mean"]
+            self.catalogue["q_so_sim"] = catalogue["q_obs"]
             self.catalogue["z"] = catalogue["z"]
             self.catalogue["z_std"] = np.zeros(len(self.catalogue["z"]))*1e-2
             self.M = catalogue["M200c_true"]
 
+            if "wl_data" in catalogue:
+                wl = catalogue["wl_data"]
+                
+                gt_obs_raw  = np.array(wl["gt_obs"])
+                R_proj_raw  = np.array(wl["R_proj"])
+                sigma_g_raw = np.array(wl["sigma_g"])
+                gt_obs_clean  = np.where(np.isnan(gt_obs_raw),  0.,    gt_obs_raw)
+                R_proj_clean  = np.where(np.isnan(R_proj_raw),  1.,    R_proj_raw)
+                self.catalogue["gt_R_proj"]  = jnp.array(R_proj_clean)
+                self.catalogue["gt_obs"]     = jnp.array(gt_obs_clean)
+                self.catalogue["gt_sigma_g"] = jnp.array(sigma_g_raw)
+                self.catalogue["gt"]         = jnp.array(gt_obs_clean[:, 0])
+            else:
+                n_cl  = len(catalogue["z"])
+                n_pts = cnc_params.get("n_points_data_lik", 128) if cnc_params else 128
+                self.catalogue["gt_R_proj"]      = np.zeros((n_cl, 10))
+                self.catalogue["gt_obs"]         = np.full((n_cl, 10), np.nan)
+                self.catalogue["gt_sigma_g"]     = np.ones((n_cl, 10))
+                self.catalogue["gt"]             = np.full(n_cl, np.nan)
+
             self.catalogue_patch = {
-                "q_so_sim" : np.zeros(len(catalogue["z"]), dtype=int),
+                "q_so_sim": np.zeros(len(catalogue["z"]), dtype=int),
+                "gt": np.zeros(len(catalogue["z"]), dtype=int)
             }
      
             self.stacked_data_labels = []

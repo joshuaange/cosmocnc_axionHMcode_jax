@@ -860,6 +860,7 @@ class cluster_number_counts:
         self._bc_set_obs = []      # list of obs_name lists per correlation set
         self._all_sets_are_1d = True  # fast-path flag
         self._1layer_obs_list = []   # 1-layer observables (direct PDF, no backward conv)
+        self._profile_obs_list = []
 
         for observable_set in self.cnc_params["observables"]:
             # Filter to observables with >= 2 layers (backward conv applicable)
@@ -873,6 +874,9 @@ class cluster_number_counts:
                 elif sr.get_n_layers() == 1:
                     if obs_name not in self._1layer_obs_list:
                         self._1layer_obs_list.append(obs_name)
+                elif sr.get_n_layers() == 0:
+                    if obs_name not in self._profile_obs_list:
+                        self._profile_obs_list.append(obs_name)
 
             if len(bc_obs_in_set) == 0 and len(self._1layer_obs_list) == 0:
                 continue
@@ -1074,7 +1078,9 @@ class cluster_number_counts:
                                f_pref_fns, f_n_psr, n_pts, n_o, n_s, n_drop,
                                s_is_nd_flags, n_pc_l0, n_pc_l1,
                                f_layer0_fns_1layer, f_pref_fns_1layer, n_1layer,
-                               n_psr_1layer, n_pc_l0_1layer):
+                               n_psr_1layer, n_pc_l0_1layer,
+                               profile_log_lik_fns, n_profile,
+                               n_psr_profile, n_pc_profile):
             def per_cluster(mn, mx, obs_vals, has_obs_vals, hz, skyfrac,
                             E_z_c, D_A_c, D_l_CMB_c, rho_c_c,
                             H0, D_CMB, gamma, z_c,
@@ -1087,7 +1093,10 @@ class cluster_number_counts:
                             obs_vals_1layer, has_obs_1layer,
                             all_pref_sr_1layer, all_layer0_sr_1layer,
                             all_layer0_sr_pc_1layer, all_cov_1layer,
-                            pre_nd_cpdfs):
+                            pre_nd_cpdfs,
+                            has_obs_profile,
+                            all_profile_sr, 
+                            all_profile_pc):
                 # Shared: lnM grid and HMF interp (computed once)
                 lnM = jnp.linspace(mn, mx, n_pts)
                 hmf = interp_uniform(lnM, lnM0_min, lnM0_max, n_lnM0, hz,
@@ -1134,6 +1143,17 @@ class cluster_number_counts:
                             n_pts, all_apply_cut[s], all_cut_val[s])
 
                     cpdf_product = cpdf_product * jnp.where(any_has, cpdf, 1.)
+
+                # this is used for the shear likelihood
+                for pl_idx in range(n_profile):
+                    pl_has = has_obs_profile[pl_idx]
+                    # Global SR params for this observable
+                    psr_pl = all_profile_sr[pl_idx]
+                    # Per-cluster data for this observable
+                    pc_pl  = all_profile_pc[pl_idx]
+                    # Call: fn(lnM, *per_cluster_data, *global_sr_params)
+                    log_lik_grid = profile_log_lik_fns[pl_idx](lnM, *pc_pl, *psr_pl)
+                    cpdf_product = cpdf_product * jnp.where(pl_has, jnp.exp(log_lik_grid), 1.)
 
                 # 1-layer observables: direct Gaussian PDF (no backward conv)
                 # Matches cosmocnc lines 771-781
@@ -1188,6 +1208,9 @@ class cluster_number_counts:
                 tuple([None]*n_1layer) if n_1layer > 0 else (),
                 # end 1-layer
                 tuple([0]*n_s),     # pre_nd_cpdfs: all vmapped on axis 0
+                1 if n_profile > 0 else 1,   # has_obs_profile always (max(1,n_profile), n_bc)
+                tuple([tuple([None]*n) for n in n_psr_profile]) if n_profile > 0 else (),
+                tuple([tuple([0]*n) if n > 0 else () for n in n_pc_profile]) if n_profile > 0 else (),
             )
             return jax.jit(jax.vmap(per_cluster, in_axes=vmap_in)), per_cluster
 
@@ -1219,13 +1242,33 @@ class cluster_number_counts:
                 _1layer_n_pc_l0.append(0)
         n_1layer = len(self._1layer_obs_list)
 
+        # Profile observables (n_layers == 0)
+        n_profile = len(self._profile_obs_list)
+        _profile_log_lik_fns = []
+        _profile_n_psr = []       # number of global SR params per observable
+        _profile_n_pc  = []       # number of per-cluster params per observable
+        
+        for o in self._profile_obs_list:
+            sr = self.scaling_relations[o]
+            _profile_log_lik_fns.append(sr.get_profile_log_lik_fn())
+            _profile_n_psr.append(sr.get_n_profile_sr_params())
+            if hasattr(sr, 'get_n_profile_pc_params'):
+                _profile_n_pc.append(sr.get_n_profile_pc_params())
+            elif hasattr(sr, 'get_layer_sr_params_per_cluster'):
+                # Try with dummy data — count without relying on injected attrs
+                _profile_n_pc.append(6 if o == "gt" else 0)
+            else:
+                _profile_n_pc.append(0)
+
         self._allinone_bc_jit, self._allinone_bc_per_cluster = _make_allinone_bc(
             set_bc_fns, set_pref_fns, set_n_psr, set_sizes, set_obs_indices,
             flat_pref_fn_list, flat_n_psr_list, n_points_dl,
             n_obs_bc, n_sets, n_drop_int, s_is_nd,
             _n_pc_l0, _n_pc_l1,
             _1layer_l0_fns, _1layer_pref_fns, n_1layer,
-            _1layer_n_psr, _1layer_n_pc_l0)
+            _1layer_n_psr, _1layer_n_pc_l0,
+            _profile_log_lik_fns, n_profile,
+            _profile_n_psr, _profile_n_pc)
 
         # ── 4c. Merged mass_range with prefactors JIT ──
         mass_range_fn_inner = self._mass_range_fn
@@ -1406,12 +1449,13 @@ class cluster_number_counts:
     #Updates parameter values (cosmological and scaling relation)
 
     def reinitialise(self):
-
         self.abundance_matrix = None
         self.n_obs_matrix = None
         self.hmf_matrix = None
         self.n_tot = None
         self.abundance_tensor = None
+        if hasattr(self, '_profile_cached'):
+            del self._profile_cached
 
     def update_params(self,cosmo_params,scal_rel_params):
 
@@ -1646,6 +1690,8 @@ class cluster_number_counts:
                         'rho_crit'   : np.array([d['rho_crit']     for d in profile_params_list]),
                         'r_s'        : np.vstack([np.asarray(d['r_s']).ravel()
                                                    for d in profile_params_list]),        # (n_z, n_M_coarse)
+                        'concentration_200c'        : np.vstack([np.asarray(d['concentration_200c']).ravel()
+                                                   for d in profile_params_list]),        # (n_z, n_M_coarse)
                         'delta_char' : np.vstack([np.asarray(d['delta_char']).ravel()
                                                    for d in profile_params_list]),        # (n_z, n_M_coarse)
                         'R_vir'      : np.vstack([np.asarray(d['R_vir']).ravel()
@@ -1677,22 +1723,6 @@ class cluster_number_counts:
         self.t_99 = 0.
 
     def get_profile_params_at_clusters(self, z_arr, lnM_arr):
-        """
-        Interpolate NFW profile parameters from the HMF grid to specific
-        (z, lnM) points. Requires get_hmf(return_profile_params=True) to
-        have been called first.
-    
-        Args:
-            z_arr:   (n_cl,) array of cluster redshifts
-            lnM_arr: (n_cl,) array of log(M / 1e14 M_sun) — e.g. posterior means
-    
-        Returns:
-            dict with arrays of shape (n_cl,):
-                'r_s'        [Mpc]
-                'delta_char' [dimensionless]
-                'rho_crit'   [M_sun/Mpc³]
-                'rho_m'      [M_sun/Mpc³]  scalar, same for all
-        """
         if not hasattr(self, 'profile_params'):
             raise RuntimeError(
                 "profile_params not available. Call get_hmf(return_profile_params=True) first.")
@@ -1706,6 +1736,7 @@ class cluster_number_counts:
         r_s_out        = np.zeros((n_cl, n_mass))
         delta_char_out = np.zeros((n_cl, n_mass))
         r_vir_out = np.zeros((n_cl, n_mass))
+        concentration_200c_out = np.zeros((n_cl, n_mass))
     
         for i in range(n_cl):
     
@@ -1725,6 +1756,12 @@ class cluster_number_counts:
 
             r_vir_out[i] = np.interp(lnM_arr[i], lnM_coarse, self.profile_params["R_vir"][iz])
 
+            concentration_200c_out[i] =  np.interp(
+                lnM_arr[i],
+                lnM_coarse,
+                self.profile_params["concentration_200c"][iz]
+            )
+
     
         rho_m = float(self.profile_params['rho_m'][0])
     
@@ -1733,6 +1770,7 @@ class cluster_number_counts:
             'delta_char': delta_char_out,
             'rho_m':      rho_m,
             'R_vir':      r_vir_out,
+            'concentration_200c':      concentration_200c_out,
         }
 
 
@@ -2104,6 +2142,33 @@ class cluster_number_counts:
             gamma_jnp = jnp.float64(gamma)
             sigma_mass_prior = jnp.float64(self.cnc_params["sigma_mass_prior"])
 
+            # ── Profile observable data (cached alongside bc_cached) ──
+            n_profile = len(self._profile_obs_list)
+            if not hasattr(self, '_profile_cached'):
+                if n_profile > 0:
+                    has_profile_list = []
+                    for o in self._profile_obs_list:
+                        if "gt_obs" in self.catalogue.catalogue:
+                            gt_col0 = jnp.asarray(
+                                self.catalogue.catalogue["gt_obs"])[idx_bc, 0]
+                            has_profile_list.append(~jnp.isnan(gt_col0))
+                        else:
+                            has_profile_list.append(jnp.zeros(n_bc, dtype=jnp.bool_))
+                    _has_obs_profile = jnp.stack(has_profile_list)
+                else:
+                    _has_obs_profile = jnp.zeros((1, n_bc), dtype=jnp.bool_)
+                self._profile_cached = {'has_obs_profile': _has_obs_profile}
+            else:
+                _has_obs_profile = self._profile_cached['has_obs_profile']
+
+            # Global SR params for profile observables (rebuilt each MCMC step)
+            if n_profile > 0:
+                all_profile_sr = tuple(
+                    self.scaling_relations[o].get_profile_sr_params(self.scal_rel_params)
+                    for o in self._profile_obs_list)
+            else:
+                all_profile_sr = ()
+
             # Cutoff (for selection observable)
             apply_cutoff_cfg = self.cnc_params["apply_obs_cutoff"]
             if apply_cutoff_cfg != False and apply_cutoff_cfg.get(str([obs_select_key]), False) == True:
@@ -2431,6 +2496,44 @@ class cluster_number_counts:
 
                 return tuple(pre_nd_list)
 
+            # Injection block
+            if n_profile > 0 and "gt" in self._profile_obs_list:
+                lnM_for_profile = np.tile(np.asarray(lnM_coarse), (n_bc, 1))
+                profile = self.get_profile_params_at_clusters(np.asarray(z_clusters), lnM_for_profile)
+                h_fid = float(self.scal_rel_params["h_fid"])
+                
+                iz_wl = np.argmin(
+                    np.abs(np.asarray(self.redshift_vec)[:, None]
+                           - np.asarray(z_clusters)[None, :]), axis=0)
+
+                rho_crit_h = np.asarray(self.rho_c)[iz_wl] / h_fid**2   # (n_bc,)
+                c_200c = profile["concentration_200c"]
+                Sigma_crit_vec_h = self.cosmo_params["Sigma_crit_vec"][iz_wl] / h_fid
+    
+                # These replace the catalogue-stored values with fresh cosmology-derived ones
+                self.scaling_relations["gt"]._rho_crit_clusters  = (rho_crit_h)          # (n_bc,) Msol/h/(Mpc/h)³
+                self.scaling_relations["gt"]._Sigma_crit_clusters = (Sigma_crit_vec_h)          # (n_bc,) Msol/h/(Mpc/h)²
+                self.scaling_relations["gt"]._c_200c_clusters = (c_200c)        
+
+                # DIAGNOSTICS
+                pc_test = self.scaling_relations["gt"].get_layer_sr_params_per_cluster(0, self.scal_rel_params)
+                print(f"n_profile_pc items: {len(pc_test)}")
+                for i, arr in enumerate(pc_test):
+                    if arr is None:
+                        print(f"  pc[{i}] = None  <-- THIS IS THE BUG")
+                    else:
+                        print(f"  pc[{i}] shape={np.asarray(arr).shape}, "
+                              f"min={np.asarray(arr).min():.3g}, max={np.asarray(arr).max():.3g}, "
+                              f"nans={np.any(np.isnan(np.asarray(arr)))}")
+
+                if hasattr(self, '_pc_slice_cache'):
+                    self._pc_slice_cache.pop(('gt', 0), None)
+
+            all_profile_pc = ()
+            if n_profile > 0:
+                all_profile_pc = tuple(
+                    _get_pc_sliced(o, 0) for o in self._profile_obs_list)
+
             if bc_chunk <= 0 or n_bc <= bc_chunk:
                 # Full vmap: all clusters at once
                 pre_nd_cpdfs = _compute_all_set_cpdfs()
@@ -2445,7 +2548,10 @@ class cluster_number_counts:
                     patch_clusters,
                     obs_vals_1l, has_obs_1l,
                     pref_sr_1l, l0_sr_1l, l0_pc_1l, cov_1l,
-                    pre_nd_cpdfs)
+                    pre_nd_cpdfs,
+                    _has_obs_profile,
+                    all_profile_sr,
+                    all_profile_pc)
             else:
                 # Chunked: process bc_chunk clusters at a time
                 log_liks_list = []
@@ -2475,7 +2581,10 @@ class cluster_number_counts:
                         patch_clusters[sl],
                         obs_1l_sl, has_1l_sl,
                         pref_sr_1l, l0_sr_1l, l0_pc_1l_sl, cov_1l,
-                        pre_nd_chunk)
+                        pre_nd_chunk,
+                        _has_obs_profile[:, sl],
+                        all_profile_sr,
+                        tuple(tuple(p[sl] for p in pc) for pc in all_profile_pc))
                     log_liks_list.append(ll)
                     cpdf_list.append(cw)
                     lnM_list.append(lm)

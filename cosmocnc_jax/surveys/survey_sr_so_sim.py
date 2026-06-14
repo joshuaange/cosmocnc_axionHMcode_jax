@@ -5,6 +5,62 @@ import cosmocnc_jax
 import logging
 from cosmocnc_jax.utils import simpson
 
+# =====================================================================
+# Shear profile functions
+# =====================================================================
+
+def _f_nfw(x):
+    x = jnp.asarray(x)
+    def x_lt_1(x):
+        return 1.0 / jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
+    def x_gt_1(x):
+        return 1.0 / jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
+    return jnp.where(x < 1, x_lt_1(x),
+           jnp.where(x > 1, x_gt_1(x), 1.0))
+
+def _g_nfw(x):
+    x = jnp.asarray(x)
+    def x_lt_1(x):
+        return jnp.log(x/2) + 1/jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
+    def x_gt_1(x):
+        return jnp.log(x/2) + 1/jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
+    return jnp.where(x < 1, x_lt_1(x),
+           jnp.where(x > 1, x_gt_1(x), 1 + jnp.log(0.5)))
+
+def gt_nfw_from_profile(r_bins, M, rho_crit_z, c_200c, Sigma_crit):
+    # Note: uses units with h as the inputs, which is different from the rest of cosmocnc.
+    r_200      = (3.0 * M / (4.0 * jnp.pi * 200.0 * rho_crit_z))**(1.0/3.0)
+    r_s        = r_200 / c_200c
+    g_c        = jnp.log(1.0 + c_200c) - c_200c / (1.0 + c_200c)
+    rho_s      = M / (4.0 * jnp.pi * r_s**3 * g_c)
+    x          = r_bins / r_s
+    Sigma      = 2.0 * rho_s * r_s / (x**2 - 1.0) * (1.0 - _f_nfw(x))
+    Sigma_bar  = 4.0 * rho_s * r_s / x**2 * _g_nfw(x)
+    DeltaSigma = Sigma_bar - Sigma
+    return DeltaSigma / (Sigma_crit - Sigma)
+
+def gt_profile_log_lik_grid(lnM_grid,
+                             # per-cluster (from get_layer_sr_params_per_cluster):
+                             R_proj, gt_obs, sigma_g,
+                             rho_crit_z_h, Sigma_crit, c_200c_grid,
+                             # global SR params (from get_profile_sr_params):
+                             b_WL_0, b_WL_M, M_WL_pivot, h_fid):
+    M_grid_h    = jnp.exp(lnM_grid) * 1e14 * h_fid        # (n_pts,) in Msol/h
+    lnM_pivot_h = jnp.log(M_WL_pivot * h_fid)
+
+    def _one_mass(M_h, c):
+        ln_MWL = b_WL_0 + b_WL_M * jnp.log(M_h) - b_WL_M * lnM_pivot_h + lnM_pivot_h
+        M_wl   = jnp.exp(ln_MWL)
+        c_wl   = jnp.interp(jnp.log(M_wl), jnp.log(M_grid_h), c_200c_grid)
+        R_safe = jnp.where(R_proj > 0., R_proj, 1.)
+        gt_pred = gt_nfw_from_profile(R_safe, M_wl, rho_crit_z_h, c_wl, Sigma_crit)
+        chi2   = jnp.sum(((gt_obs - gt_pred) / sigma_g)**2)
+        return -0.5 * chi2
+
+    logP = jax.vmap(_one_mass)(M_grid_h, c_200c_grid)
+    logP += (-jnp.sum(jnp.log(sigma_g))
+             -0.5 * gt_obs.size * jnp.log(2.0 * jnp.pi))
+    return logP
 
 # =====================================================================
 # Pure JAX scaling relation functions (JIT-compatible, no class state)
@@ -147,11 +203,10 @@ class scaling_relations:
         observable = self.observable
 
         if observable == "p_so_sim_stacked":
-
             n_layers = 1
-
+        elif observable == "gt":
+            n_layers = 0
         else:
-
             n_layers = 2
 
         return n_layers
@@ -160,10 +215,47 @@ class scaling_relations:
 
         return self.get_n_layers()
 
+    def get_profile_log_lik_fn(self):
+        if self.observable == "gt":
+            return gt_profile_log_lik_grid
+        raise ValueError(f"No profile log-lik fn for {self.observable}")
+    
+    def get_n_profile_sr_params(self):
+        if self.observable == "gt":
+            return 4
+        return 0
+    
+    def get_profile_sr_params(self, sr_params):
+        if self.observable == "gt":
+            return (jnp.float64(sr_params["b_WL_0"]),
+                    jnp.float64(sr_params["b_WL_M"]),
+                    jnp.float64(sr_params["M_WL_pivot"]),
+                    jnp.float64(sr_params["h_fid"]))
+        return ()
+    
+    def get_layer_sr_params_per_cluster(self, layer, sr_params):
+        if self.observable == "gt" and layer == 0:
+            cat = self.catalogue
+            if cat is not None and hasattr(cat, 'catalogue') \
+                    and "gt_R_proj" in cat.catalogue:
+                # Static: from catalogue
+                R_proj  = cat.catalogue["gt_R_proj"]
+                gt_obs  = cat.catalogue["gt_obs"]
+                sigma_g = cat.catalogue["gt_sigma_g"]
+                # Dynamic: injected fresh each MCMC step from cnc.py
+                rho_crit = getattr(self, '_rho_crit_clusters', None)
+                Sigma    = getattr(self, '_Sigma_crit_clusters', None)
+                c_200c   = getattr(self, '_c_200c_clusters', None)
+                return (R_proj, gt_obs, sigma_g, rho_crit, Sigma, c_200c)
+        return ()
+
     def initialise_scaling_relation(self,cosmology=None):
 
         observable = self.observable
         self.const = cosmocnc_jax.constants()
+
+        if observable == "gt":
+            pass
 
         if observable == "p_so_sim_original" or observable == "p_so_sim_stacked":
 
@@ -630,6 +722,9 @@ class scatter:
     def get_cov(self,observable1=None,observable2=None,patch1=0,patch2=0,layer=0,other_params=None):
 
         if layer == 0:
+
+            if observable1 == "gt" or observable2 == "gt":
+                return 0.
 
             if observable1 == "p_so_sim" and observable2 == "p_so_sim":
 
