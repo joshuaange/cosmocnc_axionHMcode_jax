@@ -259,13 +259,13 @@ class halo_mass_function:
                 rho_m  = self.rho_c_0 * Om0                          # Msol/Mpc^3, mean matter density at z=0
             
                 g_a = (np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full)
-                       * self.cosmology.normalisation_cached * (1 + redshift))
+                           * self.cosmology.normalisation_cached * (1 + redshift))
                 G_a = self.cosmology.G_a_cached
                 Delta_vir = func_axionHMcode_Delta_vir(redshift, Om0, G_a, E_z, g_a)
             
                 c_min   = 5.196
                 k, ps   = self.cosmology.power_spectrum.get_linear_power_spectrum(redshift)
-                sigma_r = sigma_R((k, ps), cosmology=self.cosmology)
+                sigma_r = sigma_R((k*self.h**-1, ps*self.h**3), cosmology=self.cosmology)
                 sigma_r.get_derivative(type_deriv=self.type_deriv)
                 delta_c = func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a)
             
@@ -282,7 +282,7 @@ class halo_mass_function:
                                 Delta_vir, c_min, redshift, Om0, sigma_r,
                                 self.cosmology.normalisation_cached, delta_c, E_z,
                                 self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                                min_factor=0.1, max_factor=20, return_profile_params=True)
+                                min_factor=0.1, max_factor=20, return_profile_params=True, h=self.h)
                         R_vir_vec_coarse = (3. * Mvir_coarse
                                             / (4. * np.pi * rho_m * Delta_vir))**(1./3.)
                     else:
@@ -291,7 +291,7 @@ class halo_mass_function:
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             self.cosmology.normalisation_cached, delta_c, E_z,
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                            min_factor=0.1, max_factor=20)
+                            min_factor=0.1, max_factor=20, h=self.h)
             
                     dlnMvir_dlnM200c_coarse = _smooth_log_jacobian(M_vec_coarse, Mvir_coarse)
                     dlnMvir_dlnM200c_full   = np.interp(np.log(M_vec), np.log(M_vec_coarse),
@@ -313,7 +313,7 @@ class halo_mass_function:
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             self.cosmology.normalisation_cached, delta_c, E_z,
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                            min_factor=0.1, max_factor=20, return_profile_params=True)
+                            min_factor=0.1, max_factor=20, return_profile_params=True, h=self.h)
                         r_s_vec_coarse        = r_s_vec
                         delta_char_vec_coarse = delta_char_vec
                         R_vir_vec_coarse      = R_vir_vec
@@ -324,16 +324,22 @@ class halo_mass_function:
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             self.cosmology.normalisation_cached, delta_c, E_z,
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
-                            min_factor=0.1, max_factor=20)
+                            min_factor=0.1, max_factor=20, h=self.h)
             
                     dMvir_dM200c = (np.asarray(Mvir_vec) / np.asarray(M_vec)) * _smooth_log_jacobian(np.asarray(M_vec), np.asarray(Mvir_vec))
             
                 # HMF in M_vir then Jacobian to M_200c
-                (sigma, dsigmadR_vir) = sigma_r.get_sigma_M(Mvir_vec, rho_m, get_deriv=True)
-                R_lagrangian      = sigma_r.R_eval
-                dM_dR_lagrangian  = 4. * np.pi * rho_m * R_lagrangian**2
-                dlnsigma2_dlnMvir = ((Mvir_vec / sigma**2)
-                                      * (2. * sigma * dsigmadR_vir) / dM_dR_lagrangian)
+                rho_m_for_sigma = rho_m / self.h**2 
+                Mvir_for_sigma  = np.asarray(Mvir_vec) * self.h   # Msol → Msol/h
+                (sigma, dsigmadR_vir) = sigma_r.get_sigma_M(
+                    Mvir_for_sigma, rho_m_for_sigma, get_deriv=True)
+                #R_lagrangian     = sigma_r.R_eval           # now Mpc/h
+                #dM_dR_lagrangian = 4. * np.pi * rho_m_for_sigma * R_lagrangian**2
+                #dlnsigma2_dlnMvir = ((Mvir_for_sigma / sigma**2)
+                #                      * (2. * sigma * dsigmadR_vir) / dM_dR_lagrangian)
+                R_for_sigma = (3*Mvir_for_sigma/(4 * np.pi * rho_m_for_sigma))**(1/3)
+                dR_dlnM = R_for_sigma / 3.0
+                dlnsigma2_dlnMvir = (2.0 * dsigmadR_vir * dR_dlnM) / sigma
             
                 nu     = delta_c / sigma
                 p_st   = 0.3
@@ -345,6 +351,7 @@ class halo_mass_function:
             
                 hmf_vir = (0.5 * (rho_m / Mvir_vec**2)
                             * func_sheth_tormen * np.abs(dlnsigma2_dlnMvir))
+                hmf_vir /= self.h
             
                 hmf    = hmf_vir * dMvir_dM200c
                 M_eval = M_vec
@@ -700,7 +707,7 @@ def func_axionHMcode_Delta_vir(redshift, Om0, G_a, E_z, g_a, version='dome'):
 
 
 def func_axionHMcode_z_formation(redshift, Mvir_with_h_units, rho_m_with_h_units,
-                                 Om0, sigma_r, normalisation, delta_c, E_z, f=0.01):
+                                 Om0, sigma_r, normalisation, delta_c, E_z, f=0.01, h=0.68):
     def solve_single(M_single):
         sigma = sigma_r.get_sigma_M(f * M_single, rho_m_with_h_units, get_deriv=False)
         target = func_axionHMcode_D_z_unnorm(redshift, Om0, E_z) / normalisation * delta_c / sigma
@@ -722,7 +729,7 @@ def func_axionHMcode_z_formation(redshift, Mvir_with_h_units, rho_m_with_h_units
 
 def func_axionHMcode_z_formation_fast(redshift, M_vir_grid, rho_m, Om0,
                                       sigma_r, normalisation, delta_c, E_z,
-                                      D_grid_z_full, D_grid_full, f=0.01):
+                                      D_grid_z_full, D_grid_full, f=0.01, h=0.68):
     #Precomputes z_formation on a mass grid using vectorized sigma and a single precomputed D(z) interpolation table.
     # Precompute D(z)/D(0) on a z grid once
     mask = D_grid_z_full > redshift
@@ -813,14 +820,14 @@ _bisect_vmap = jax.jit(jax.vmap(_bisect_single,
 def find_M_vir_from_M_200c(M_vec, R_200c, rho_m, rho_crit_z,
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             normalisation, delta_c, E_z, D_grid_z_full, D_grid_full,
-                            min_factor=0.5, max_factor=10, return_profile_params=False):
+                            min_factor=0.5, max_factor=10, return_profile_params=False, h=0.68):
     # Precompute z_formation grid (numpy, not JIT-able due to sigma_r)
     M_vir_grid = np.exp(np.linspace(
         np.log(min_factor * M_vec.min()),
         np.log(max_factor * M_vec.max()), 300))
     z_formation_interp = func_axionHMcode_z_formation_fast(
         redshift, M_vir_grid, rho_m, Om0, sigma_r,
-        normalisation, delta_c, E_z, D_grid_z_full, D_grid_full)
+        normalisation, delta_c, E_z, D_grid_z_full, D_grid_full, h=h)
 
     log_M_vir_grid = jnp.asarray(np.log(M_vir_grid))
     z_f_grid = jnp.asarray(np.array([z_formation_interp(m) for m in M_vir_grid]))
