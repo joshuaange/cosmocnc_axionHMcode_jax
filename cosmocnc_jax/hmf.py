@@ -330,16 +330,10 @@ class halo_mass_function:
             
                 # HMF in M_vir then Jacobian to M_200c
                 rho_m_for_sigma = rho_m / self.h**2 
-                Mvir_for_sigma  = np.asarray(Mvir_vec) * self.h   # Msol → Msol/h
-                (sigma, dsigmadR_vir) = sigma_r.get_sigma_M(
-                    Mvir_for_sigma, rho_m_for_sigma, get_deriv=True)
-                #R_lagrangian     = sigma_r.R_eval           # now Mpc/h
-                #dM_dR_lagrangian = 4. * np.pi * rho_m_for_sigma * R_lagrangian**2
-                #dlnsigma2_dlnMvir = ((Mvir_for_sigma / sigma**2)
-                #                      * (2. * sigma * dsigmadR_vir) / dM_dR_lagrangian)
-                R_for_sigma = (3*Mvir_for_sigma/(4 * np.pi * rho_m_for_sigma))**(1/3)
-                dR_dlnM = R_for_sigma / 3.0
-                dlnsigma2_dlnMvir = (2.0 * dsigmadR_vir * dR_dlnM) / sigma
+                Mvir_for_sigma  = np.asarray(Mvir_vec) * self.h   # Msol/h
+                sigma_r.get_dlnsigma2_dlnM(rho_m_for_sigma, self.h)
+                sigma = sigma_r.get_sigma_M(Mvir_for_sigma, rho_m_for_sigma, get_deriv=False)
+                dlnsigma2_dlnMvir = sigma_r.get_dlnsigma2_dlnM_M(Mvir_for_sigma, rho_m_for_sigma)
             
                 nu     = delta_c / sigma
                 p_st   = 0.3
@@ -350,7 +344,7 @@ class halo_mass_function:
                                       * np.exp(-q_st * nu**2 / 2.))
             
                 hmf_vir = (0.5 * (rho_m / Mvir_vec**2)
-                            * func_sheth_tormen * np.abs(dlnsigma2_dlnMvir))
+                            * func_sheth_tormen * jnp.abs(dlnsigma2_dlnMvir))
                 hmf_vir /= self.h
             
                 hmf    = hmf_vir * dMvir_dM200c
@@ -519,6 +513,35 @@ class sigma_R:
         self.sigma_vec = jnp.sqrt(self.var_vec)
         self._tv1 = _tv1
 
+    def get_dlnsigma2_dlnM(self, rho_m_h, h):
+        """Compute dlnsigma²/dlnM matching axionHMcode eq.22
+        """
+        # R_vec is in Mpc/h (since k is in h/Mpc)
+        # Reconstruct M from R: M = (4pi/3)*rho_m_h*R³  [Msol/h]
+        R = self.R_vec   # (n_R,)  Mpc/h
+        k = jnp.asarray(self.k)   # (n_k,)  h/Mpc
+        P = jnp.asarray(self.pk)  # (n_k,)  (Mpc/h)³
+        
+        # x[i,j] = k[j] * R[i]  — (n_R, n_k)
+        x = R[:, None] * k[None, :]
+        
+        # term1, term2 from generation code
+        mask = x > 1e-3
+        term1 = jnp.where(mask, jnp.sin(x)*(1. - 3./x**2) + 3.*jnp.cos(x)/x, 0.)
+        term2 = jnp.where(mask, jnp.sin(x) - x*jnp.cos(x), 0.)
+        
+        # integrand: term1*term2*P/k²  shape (n_R, n_k)
+        integrand = term1 * term2 * P[None, :] / k[None, :]**2
+        
+        # integrate over k using trapezoid  (n_R,)
+        dk = jnp.diff(k)
+        integrals = jnp.sum(
+            0.5 * (integrand[:, :-1] + integrand[:, 1:]) * dk[None, :],
+            axis=1)
+        
+        # dlnsigma²/dlnM = integrals * 3 / (pi² * sigma² * R⁴)
+        self.dlnsigma2_dlnM_vec = integrals * 3. / (jnp.pi**2 * self.var_vec * R**4)
+
     def get_derivative(self, type_deriv="analytical"):
 
         if type_deriv == "analytical":
@@ -551,6 +574,11 @@ class sigma_R:
             ret = (sigma, dsigmadR)
 
         return ret
+
+    def get_dlnsigma2_dlnM_M(self, M_vec, rho_m_h):
+        """Interpolate dlnsigma²/dlnM at given masses - axionHMcode implementation."""
+        R = (3. * M_vec / (4. * jnp.pi * rho_m_h))**(1./3.)
+        return jnp.interp(R, self.R_vec, self.dlnsigma2_dlnM_vec)
 
 
 def build_batch_sigma_fns(tv0, tv1, k_arr, type_deriv="analytical"):
