@@ -250,10 +250,12 @@ class halo_mass_function:
                     Del = 500
                 else:
                     print("ST_axionHMcode not yet updated to work with non-200c mass definitions")
-            
-                E_z = lambda z: self.cosmology.background_cosmology.H(z).value / (100. * self.h)
-            
+
                 Om0 = self.cosmology.cosmo_params["Om0"]
+                #E_z = lambda z: self.cosmology.background_cosmology.H(z).value / (100. * self.h)
+                Ow0 = 1. - Om0   # flat LCDM, no radiation
+                E_z = lambda z: np.sqrt(Om0*(1+z)**3 + Ow0)
+            
                 rho_crit_z = self.rho_c_0 * E_z(redshift)**2        # Msol/Mpc^3
                 R_200c = (3. * M_vec / (4. * np.pi * rho_crit_z * Del))**(1./3.)   # Mpc
                 rho_m  = self.rho_c_0 * Om0                          # Msol/Mpc^3, mean matter density at z=0
@@ -766,7 +768,7 @@ def func_axionHMcode_z_formation_fast(redshift, M_vir_grid, rho_m, Om0,
     D_z = np.interp(redshift, D_grid_z_full, D_grid_full)
 
     # Vectorized sigma for all masses at once
-    sigma_grid = sigma_r.get_sigma_M(f * M_vir_grid, rho_m, get_deriv=False)
+    sigma_grid = sigma_r.get_sigma_M(f * M_vir_grid * h, rho_m / h**2, get_deriv=False)
     target_grid = D_z * delta_c / sigma_grid
 
     # For each mass, find z_f by interpolating the inverse D(z) table
@@ -848,11 +850,11 @@ _bisect_vmap = jax.jit(jax.vmap(_bisect_single,
 def find_M_vir_from_M_200c(M_vec, R_200c, rho_m, rho_crit_z,
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             normalisation, delta_c, E_z, D_grid_z_full, D_grid_full,
-                            min_factor=0.5, max_factor=10, return_profile_params=False, h=0.68):
+                            min_factor=0.1, max_factor=20, return_profile_params=False, h=0.68, num_points = 300):
     # Precompute z_formation grid (numpy, not JIT-able due to sigma_r)
     M_vir_grid = np.exp(np.linspace(
         np.log(min_factor * M_vec.min()),
-        np.log(max_factor * M_vec.max()), 300))
+        np.log(max_factor * M_vec.max()), num_points))
     z_formation_interp = func_axionHMcode_z_formation_fast(
         redshift, M_vir_grid, rho_m, Om0, sigma_r,
         normalisation, delta_c, E_z, D_grid_z_full, D_grid_full, h=h)

@@ -269,7 +269,7 @@ cosmo_params_default = {
 "Ob0h2":0.04897*0.674**2,
 "Oc0h2":(0.315-0.04897)*0.674**2,
 "h":0.68,
-"A_s":2.08467e-09, #if amplitude_parameter == "sigma_8", this is overriden by the value given to "sigma_8" in this dictionary
+"A_s":2.1e-09, #if amplitude_parameter == "sigma_8", this is overriden by the value given to "sigma_8" in this dictionary
 "n_s":0.96,
 "m_nu":0.06, #m_nu is sum of the three neutrino masses
 "sigma_8":0.811, #if amplitude_paramter == "A_s", this is overriden; the amplitude is taken by the value given to "A_s" in this dictionary
