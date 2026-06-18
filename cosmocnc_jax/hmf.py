@@ -267,7 +267,7 @@ class halo_mass_function:
             
                 c_min   = 5.196
                 k, ps   = self.cosmology.power_spectrum.get_linear_power_spectrum(redshift)
-                sigma_r = sigma_R((k*self.h**-1, ps*self.h**3), cosmology=self.cosmology)
+                sigma_r = sigma_R((k*self.h**-1, ps*self.h**3 * self.cosmology.cosmo_params["Pk_scaling_for_sigmaM"]), cosmology=self.cosmology)
                 sigma_r.get_derivative(type_deriv=self.type_deriv)
                 delta_c = func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a)
             
