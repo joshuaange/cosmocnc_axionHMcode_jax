@@ -264,21 +264,24 @@ scaling_relation_params_default = {
 
 cosmo_params_default = {
 
-"Om0":0.315,
-"Ob0":0.04897,
-"Ob0h2":0.04897*0.674**2,
-"Oc0h2":(0.315-0.04897)*0.674**2,
+"Om0":0.30999999999999994,
+"Ob0":0.04899999999999999,
+"Ob0h2":0.04899999999999999*0.68**2,
+"Oc0h2":(0.30999999999999994-0.04899999999999999)*0.68**2,
 "h":0.68,
 "A_s":2.1e-09, #if amplitude_parameter == "sigma_8", this is overriden by the value given to "sigma_8" in this dictionary
-"n_s":0.96,
-"m_nu":0.06, #m_nu is sum of the three neutrino masses
+"n_s":0.965,
+"m_nu":0.0, #m_nu is sum of the three neutrino masses
 "sigma_8":0.811, #if amplitude_paramter == "A_s", this is overriden; the amplitude is taken by the value given to "A_s" in this dictionary
-"tau_reio": 0.0544,
+"tau_reio": 0.06,
 "w0": -1.,
-"Onu0": 0.00141808,
+"Onu0": 0.0,
 "N_eff": 3.046,
+'m_ncdm': 0.0,    
+'N_ncdm': 0,      
+'N_ur': 3.046,
 
 "k_cutoff": 1e8,
-"ps_cutoff": 1,
+"ps_cutoff": 1.,
 
 }

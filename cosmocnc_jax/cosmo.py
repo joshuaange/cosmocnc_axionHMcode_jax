@@ -121,12 +121,15 @@ class cosmology_model:
                 'H0': self.cosmo_params["h"]*100.,
                 'tau_reio':  self.cosmo_params["tau_reio"],
                 'n_s': self.cosmo_params["n_s"],
+                'm_ncdm': self.cosmo_params["m_ncdm"],
+                'N_ncdm': self.cosmo_params["N_ncdm"],
+                'N_ur': self.cosmo_params["N_ur"],
 
                 'output': self.cnc_params["class_sz_output"],
 
                 'jax': 1,
 
-                'HMF_prescription_NCDM': 1,
+                'HMF_prescription_NCDM': self.cosmo_params["N_ncdm"],
                 'no_spline_in_tinker': 1,
 
                 'M_min' : self.cnc_params["M_min"]*0.5,
@@ -297,7 +300,7 @@ class cosmology_model:
             'tau_reio': cp["tau_reio"],
             'n_s': cp["n_s"],
             'ln10^{10}A_s': np.log(cp.get("A_s", 2.1e-9) * 1e10),
-            'm_ncdm': cp.get("m_nu", 0.06),
+            'm_ncdm': cp.get("m_nu", 0.00),
         }
 
     def _find_As_from_sigma8_jax(self, sigma8_target):
@@ -345,7 +348,7 @@ class cosmology_model:
         deg_ncdm = _DEG_NCDM_PER_MODEL.get(self.cnc_params['cosmo_model'], 1)
         Ob = self._pvd['omega_b'] / h**2
         Ocdm = self._pvd['omega_cdm'] / h**2
-        m_ncdm = self._pvd.get('m_ncdm', 0.06)
+        m_ncdm = self._pvd.get('m_ncdm', 0.00)
         Oncdm = deg_ncdm * m_ncdm / (93.14 * h**2)
         self._set_om_budget(Ob=Ob, Ocdm=Ocdm, Oncdm=Oncdm, deg_ncdm=deg_ncdm)
 
@@ -520,7 +523,7 @@ class cosmology_model:
             "ln1e10A_s": float(np.log(cp.get("A_s", 2.1e-9) * 1e10)),
             "n_s": cp["n_s"],
             "tau_reio": cp["tau_reio"],
-            "m_ncdm": cp.get("m_nu", 0.06),
+            "m_ncdm": cp.get("m_nu", 0.00),
         }
         # Optional model-specific extras.
         if "w0" in cp:

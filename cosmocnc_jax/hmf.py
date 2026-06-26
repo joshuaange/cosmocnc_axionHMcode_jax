@@ -246,8 +246,6 @@ class halo_mass_function:
             
                 if self.mass_definition == "200c":
                     Del = 200
-                elif self.mass_definition == "500c":
-                    Del = 500
                 else:
                     print("ST_axionHMcode not yet updated to work with non-200c mass definitions")
 
@@ -329,7 +327,6 @@ class halo_mass_function:
                             min_factor=0.1, max_factor=20, h=self.h)
             
                     dMvir_dM200c = (np.asarray(Mvir_vec) / np.asarray(M_vec)) * _smooth_log_jacobian(np.asarray(M_vec), np.asarray(Mvir_vec))
-            
                 # HMF in M_vir then Jacobian to M_200c
                 rho_m_for_sigma = rho_m / self.h**2 
                 Mvir_for_sigma  = np.asarray(Mvir_vec) * self.h   # Msol/h
@@ -345,19 +342,22 @@ class halo_mass_function:
                                       * (1. + (q_st**0.5 * nu)**(-2.*p_st))
                                       * np.exp(-q_st * nu**2 / 2.))
             
-                hmf_vir = (0.5 * (rho_m / Mvir_vec**2)
-                            * func_sheth_tormen * jnp.abs(dlnsigma2_dlnMvir))
-                hmf_vir /= self.h
+                hmf_vir = (0.5 * (rho_m_for_sigma / Mvir_for_sigma**2)
+                            * func_sheth_tormen * jnp.abs(dlnsigma2_dlnMvir)) # this is 1/M dn/dlndM_vir = dn / dM_vir (where Mvir is in Msol/h)
+                hmf_vir *= self.h # dn / dM_vir (where Mvir is in Msol)
             
-                hmf    = hmf_vir * dMvir_dM200c
+                hmf = hmf_vir * dMvir_dM200c # dn / dM_200c (where M_200c is in Msol)
+
                 M_eval = M_vec
-            
-                hmf    = hmf * 1e14
-                M_eval = M_eval / 1e14
-            
+
+                hmf = hmf*1e14
+                M_eval = M_eval/1e14
+
                 if log == True:
-                    hmf    = hmf * M_eval
-                    M_eval = np.log(M_eval)
+
+                    hmf = hmf*M_eval
+                    M_eval = jnp.log(M_eval)
+
 
             if self.hmf_type == "Tinker08":
 
