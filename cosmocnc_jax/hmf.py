@@ -21,23 +21,23 @@ TINKER08_a = jnp.array([1.47,1.52,1.56,1.61,1.87,2.13,2.30,2.53,2.66], dtype=jnp
 TINKER08_b = jnp.array([2.57,2.25,2.05,1.87,1.59,1.51,1.46,1.44,1.41], dtype=jnp.float64)
 TINKER08_c = jnp.array([1.19,1.27,1.34,1.45,1.58,1.80,1.97,2.24,2.44], dtype=jnp.float64)
 
-def _smooth_log_jacobian(M200c_coarse, Mvir_coarse):
+def _smooth_log_jacobian(M500c_coarse, Mvir_coarse):
     """
-    Compute d(lnMvir)/d(lnM200c) using central differences in log-log space.
+    Compute d(lnMvir)/d(lnM500c) using central differences in log-log space.
     Uses forward/backward at endpoints but with larger stencil to avoid
     the one-sided difference instability of np.gradient.
     """
-    n = len(M200c_coarse)
-    lnM200c = np.log(M200c_coarse)
+    n = len(M500c_coarse)
+    lnM500c = np.log(M500c_coarse)
     lnMvir  = np.log(Mvir_coarse)
     result  = np.zeros(n)
 
     # Central differences for interior points
-    result[1:-1] = (lnMvir[2:] - lnMvir[:-2]) / (lnM200c[2:] - lnM200c[:-2])
+    result[1:-1] = (lnMvir[2:] - lnMvir[:-2]) / (lnM500c[2:] - lnM500c[:-2])
 
     # Forward/backward at endpoints
-    result[0]  = (lnMvir[1]  - lnMvir[0])  / (lnM200c[1]  - lnM200c[0])
-    result[-1] = (lnMvir[-1] - lnMvir[-2]) / (lnM200c[-1] - lnM200c[-2])
+    result[0]  = (lnMvir[1]  - lnMvir[0])  / (lnM500c[1]  - lnM500c[0])
+    result[-1] = (lnMvir[-1] - lnMvir[-2]) / (lnM500c[-1] - lnM500c[-2])
 
     return result
 
@@ -244,10 +244,10 @@ class halo_mass_function:
 
             if self.hmf_type == "ST_axionHMcode":
             
-                if self.mass_definition == "200c":
-                    Del = 200
+                if self.mass_definition == "500c":
+                    Del = 500
                 else:
-                    print("ST_axionHMcode not yet updated to work with non-200c mass definitions")
+                    print("ST_axionHMcode not yet updated to work with non-500c mass definitions")
 
                 Om0 = self.cosmology.cosmo_params["Om0"]
                 #E_z = lambda z: self.cosmology.background_cosmology.H(z).value / (100. * self.h)
@@ -255,7 +255,7 @@ class halo_mass_function:
                 E_z = lambda z: np.sqrt(Om0*(1+z)**3 + Ow0)
             
                 rho_crit_z = self.rho_c_0 * E_z(redshift)**2        # Msol/Mpc^3
-                R_200c = (3. * M_vec / (4. * np.pi * rho_crit_z * Del))**(1./3.)   # Mpc
+                R_500c = (3. * M_vec / (4. * np.pi * rho_crit_z * Del))**(1./3.)   # Mpc
                 rho_m  = self.rho_c_0 * Om0                          # Msol/Mpc^3, mean matter density at z=0
             
                 g_a = (np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full)
@@ -265,7 +265,17 @@ class halo_mass_function:
             
                 c_min   = 5.196
                 k, ps   = self.cosmology.power_spectrum.get_linear_power_spectrum(redshift)
-                sigma_r = sigma_R((k*self.h**-1, ps*self.h**3 * self.cosmology.cosmo_params["Pk_scaling_for_sigmaM"]), cosmology=self.cosmology)
+                k_h     = k * self.h**-1
+
+                cache_key = (len(k_h), float(k_h[0]), float(k_h[-1]))
+                if getattr(self.cosmology, '_tv_axion_key', None) != cache_key:
+                    from mcfit import TophatVar
+                    self.cosmology._tv0_axion = TophatVar(np.asarray(k_h), lowring=True, deriv=0, backend='jax')
+                    self.cosmology._tv1_axion = TophatVar(np.asarray(k_h), lowring=True, deriv=1, backend='jax')
+                    self.cosmology._tv_axion_key = cache_key
+                    
+                sigma_r = sigma_R((k*self.h**-1, ps*self.h**3 * self.cosmology.cosmo_params["Pk_scaling_for_sigmaM"]), 
+                                  cosmology=self.cosmology, _tv0=self.cosmology._tv0_axion, _tv1=self.cosmology._tv1_axion)
                 sigma_r.get_derivative(type_deriv=self.type_deriv)
                 delta_c = func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a)
             
@@ -273,12 +283,12 @@ class halo_mass_function:
                     n_coarse     = self.cosmology.cosmo_params["n_mass_points_coarse"]
                     M_vec_coarse = np.exp(np.linspace(np.log(M_vec.min()),
                                                        np.log(M_vec.max()), n_coarse))
-                    R_200c_coarse = (3. * M_vec_coarse / (4. * np.pi * rho_crit_z * Del))**(1./3.)
+                    R_500c_coarse = (3. * M_vec_coarse / (4. * np.pi * rho_crit_z * Del))**(1./3.)
             
                     if return_profile_params:
                         Mvir_coarse, R_vir_vec_coarse, r_s_vec_coarse, delta_char_vec_coarse = \
-                            find_M_vir_from_M_200c(
-                                M_vec_coarse, R_200c_coarse, rho_m, rho_crit_z,
+                            find_M_vir_from_M_500c(
+                                M_vec_coarse, R_500c_coarse, rho_m, rho_crit_z,
                                 Delta_vir, c_min, redshift, Om0, sigma_r,
                                 self.cosmology.normalisation_cached, delta_c, E_z,
                                 self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
@@ -286,19 +296,19 @@ class halo_mass_function:
                         R_vir_vec_coarse = (3. * Mvir_coarse
                                             / (4. * np.pi * rho_m * Delta_vir))**(1./3.)
                     else:
-                        Mvir_coarse = find_M_vir_from_M_200c(
-                            M_vec_coarse, R_200c_coarse, rho_m, rho_crit_z,
+                        Mvir_coarse = find_M_vir_from_M_500c(
+                            M_vec_coarse, R_500c_coarse, rho_m, rho_crit_z,
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             self.cosmology.normalisation_cached, delta_c, E_z,
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
                             min_factor=0.1, max_factor=20, h=self.h)
             
-                    dlnMvir_dlnM200c_coarse = _smooth_log_jacobian(M_vec_coarse, Mvir_coarse)
-                    dlnMvir_dlnM200c_full   = np.interp(np.log(M_vec), np.log(M_vec_coarse),
-                                                          dlnMvir_dlnM200c_coarse)
+                    dlnMvir_dlnM500c_coarse = _smooth_log_jacobian(M_vec_coarse, Mvir_coarse)
+                    dlnMvir_dlnM500c_full   = np.interp(np.log(M_vec), np.log(M_vec_coarse),
+                                                          dlnMvir_dlnM500c_coarse)
                     Mvir_vec = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse),
                                                  np.log(Mvir_coarse)))
-                    dMvir_dM200c = (Mvir_vec / M_vec) * dlnMvir_dlnM200c_full
+                    dMvir_dM500c = (Mvir_vec / M_vec) * dlnMvir_dlnM500c_full
             
                     if return_profile_params:
                         r_s_vec        = np.exp(np.interp(np.log(M_vec), np.log(M_vec_coarse),
@@ -308,8 +318,8 @@ class halo_mass_function:
             
                 else:
                     if return_profile_params:
-                        Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = find_M_vir_from_M_200c(
-                            M_vec, R_200c, rho_m, rho_crit_z,
+                        Mvir_vec, R_vir_vec, r_s_vec, delta_char_vec = find_M_vir_from_M_500c(
+                            M_vec, R_500c, rho_m, rho_crit_z,
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             self.cosmology.normalisation_cached, delta_c, E_z,
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
@@ -318,16 +328,17 @@ class halo_mass_function:
                         delta_char_vec_coarse = delta_char_vec
                         R_vir_vec_coarse      = R_vir_vec
                         M_vec_coarse          = M_vec
+                        R_500c_coarse         = R_500c
                     else:
-                        Mvir_vec = find_M_vir_from_M_200c(
-                            M_vec, R_200c, rho_m, rho_crit_z,
+                        Mvir_vec = find_M_vir_from_M_500c(
+                            M_vec, R_500c, rho_m, rho_crit_z,
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             self.cosmology.normalisation_cached, delta_c, E_z,
                             self.cosmology.D_grid_z_full, self.cosmology.D_grid_full,
                             min_factor=0.1, max_factor=20, h=self.h)
             
-                    dMvir_dM200c = (np.asarray(Mvir_vec) / np.asarray(M_vec)) * _smooth_log_jacobian(np.asarray(M_vec), np.asarray(Mvir_vec))
-                # HMF in M_vir then Jacobian to M_200c
+                    dMvir_dM500c = (np.asarray(Mvir_vec) / np.asarray(M_vec)) * _smooth_log_jacobian(np.asarray(M_vec), np.asarray(Mvir_vec))
+                # HMF in M_vir then Jacobian to M_500c
                 rho_m_for_sigma = rho_m / self.h**2 
                 Mvir_for_sigma  = np.asarray(Mvir_vec) * self.h   # Msol/h
                 sigma_r.get_dlnsigma2_dlnM(rho_m_for_sigma, self.h)
@@ -343,10 +354,9 @@ class halo_mass_function:
                                       * np.exp(-q_st * nu**2 / 2.))
             
                 hmf_vir = (0.5 * (rho_m_for_sigma / Mvir_for_sigma**2)
-                            * func_sheth_tormen * jnp.abs(dlnsigma2_dlnMvir)) # this is 1/M dn/dlndM_vir = dn / dM_vir (where Mvir is in Msol/h)
-                hmf_vir *= self.h # dn / dM_vir (where Mvir is in Msol)
+                            * func_sheth_tormen * jnp.abs(dlnsigma2_dlnMvir)) # this is 1/M dn/dlndM_vir = dn / dM_vir 
             
-                hmf = hmf_vir * dMvir_dM200c # dn / dM_200c (where M_200c is in Msol)
+                hmf = hmf_vir * dMvir_dM500c # dn / dM_500c (where M_500c is in Msol)
 
                 M_eval = M_vec
 
@@ -355,7 +365,7 @@ class halo_mass_function:
 
                 if log == True:
 
-                    hmf = hmf*M_eval
+                    hmf = hmf*M_eval*self.h
                     M_eval = jnp.log(M_eval)
 
 
@@ -487,7 +497,7 @@ class halo_mass_function:
                 'r_s'        : r_s_vec_coarse,
                 'delta_char' : delta_char_vec_coarse,
                 'concentration_virial' : R_vir_vec_coarse/r_s_vec_coarse,
-                'concentration_200c'   : R_200c_coarse/r_s_vec_coarse,
+                'concentration_500c'   : R_500c_coarse/r_s_vec_coarse,
                 'rho_m'      : rho_m  # scalar, same for all M at this z
             }
         return M_eval,hmf
@@ -767,6 +777,10 @@ def func_axionHMcode_z_formation_fast(redshift, M_vir_grid, rho_m, Om0,
     D_grid = D_grid_full[mask]
     D_z = np.interp(redshift, D_grid_z_full, D_grid_full)
 
+    z_grid = np.concatenate([[redshift], z_grid])
+    D_grid = np.concatenate([[D_z], D_grid])
+    D_z = np.interp(redshift, D_grid_z_full, D_grid_full)
+
     # Vectorized sigma for all masses at once
     sigma_grid = sigma_r.get_sigma_M(f * M_vir_grid * h, rho_m / h**2, get_deriv=False)
     target_grid = D_z * delta_c / sigma_grid
@@ -813,7 +827,7 @@ def func_axionHMcode_delta_c(redshift, Om0, G_a, E_z, g_a, version='dome'):
         return 1.686 * ( 1 + f_1*np.log10(Omega_m_z)**alpha_1 + f_2*np.log10(Omega_m_z)**alpha_2)
 
 @jax.jit
-def _bisect_single(log_lo, log_hi, M200c, R200c, rho_m, Delta_vir, c_min,
+def _bisect_single(log_lo, log_hi, M500c, R500c, rho_m, Delta_vir, c_min,
                    redshift, log_M_vir_grid, z_f_grid):
     def g(x):
         return jnp.log(1. + x) - x / (1. + x)
@@ -828,10 +842,10 @@ def _bisect_single(log_lo, log_hi, M200c, R200c, rho_m, Delta_vir, c_min,
         r_s = R_vir / conc
         delta_char = Delta_vir * conc**3 / (3. * g(conc))
         # NFW enclosed mass uses rho_m (mean matter density at z=0), consistent with Delta_vir definition
-        x_200c = R200c / r_s
-        M_enc = 4. * jnp.pi * delta_char * rho_m * r_s**3 * g(x_200c)
-        lo = jnp.where(M_enc < M200c, mid, lo)
-        hi = jnp.where(M_enc < M200c, hi, mid)
+        x_500c = R500c / r_s
+        M_enc = 4. * jnp.pi * delta_char * rho_m * r_s**3 * g(x_500c)
+        lo = jnp.where(M_enc < M500c, mid, lo)
+        hi = jnp.where(M_enc < M500c, hi, mid)
         return (lo, hi), None
 
     (lo, hi), _ = jax.lax.scan(body, (log_lo, log_hi), None, length=30)
@@ -847,7 +861,7 @@ def _bisect_single(log_lo, log_hi, M200c, R200c, rho_m, Delta_vir, c_min,
 _bisect_vmap = jax.jit(jax.vmap(_bisect_single,
     in_axes=(0, 0, 0, 0, None, None, None, None, None, None)))
 
-def find_M_vir_from_M_200c(M_vec, R_200c, rho_m, rho_crit_z,
+def find_M_vir_from_M_500c(M_vec, R_500c, rho_m, rho_crit_z,
                             Delta_vir, c_min, redshift, Om0, sigma_r,
                             normalisation, delta_c, E_z, D_grid_z_full, D_grid_full,
                             min_factor=0.1, max_factor=20, return_profile_params=False, h=0.68, num_points = 300):
@@ -864,11 +878,11 @@ def find_M_vir_from_M_200c(M_vec, R_200c, rho_m, rho_crit_z,
 
     log_lo = jnp.log(jnp.asarray(min_factor * M_vec))
     log_hi = jnp.log(jnp.asarray(max_factor * M_vec))
-    M200c_jnp = jnp.asarray(M_vec)
-    R200c_jnp = jnp.asarray(R_200c)
+    M500c_jnp = jnp.asarray(M_vec)
+    R500c_jnp = jnp.asarray(R_500c)
 
     Mvir_vec, r_s_vec, delta_char_vec = _bisect_vmap(
-        log_lo, log_hi, M200c_jnp, R200c_jnp,
+        log_lo, log_hi, M500c_jnp, R500c_jnp,
         float(rho_m), float(Delta_vir), float(c_min), float(redshift),
         log_M_vir_grid, z_f_grid)
 

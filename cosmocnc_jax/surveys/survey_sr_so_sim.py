@@ -11,21 +11,19 @@ from cosmocnc_jax.utils import simpson
 
 def _f_nfw(x):
     x = jnp.asarray(x)
-    def x_lt_1(x):
-        return 1.0 / jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
-    def x_gt_1(x):
-        return 1.0 / jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
-    return jnp.where(x < 1, x_lt_1(x),
-           jnp.where(x > 1, x_gt_1(x), 1.0))
+    x_lo = jnp.where(x < 1, x, 0.0)   # safe for sqrt(1-x**2)
+    x_hi = jnp.where(x > 1, x, 2.0)   # safe for sqrt(x**2-1)
+    def x_lt_1(x): return 1.0 / jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
+    def x_gt_1(x): return 1.0 / jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
+    return jnp.where(x < 1, x_lt_1(x_lo), jnp.where(x > 1, x_gt_1(x_hi), 1.0))
 
 def _g_nfw(x):
     x = jnp.asarray(x)
-    def x_lt_1(x):
-        return jnp.log(x/2) + 1/jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
-    def x_gt_1(x):
-        return jnp.log(x/2) + 1/jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
-    return jnp.where(x < 1, x_lt_1(x),
-           jnp.where(x > 1, x_gt_1(x), 1 + jnp.log(0.5)))
+    x_lo = jnp.where(x < 1, x, 0.0)   # safe for sqrt(1-x**2)
+    x_hi = jnp.where(x > 1, x, 2.0)   # safe for sqrt(x**2-1)
+    def x_lt_1(x): return jnp.log(x/2) + 1/jnp.sqrt(1 - x**2) * jax.lax.atanh(jnp.sqrt(1 - x**2))
+    def x_gt_1(x): return jnp.log(x/2) + 1/jnp.sqrt(x**2 - 1) * jnp.arctan(jnp.sqrt(x**2 - 1))
+    return jnp.where(x < 1, x_lt_1(x_lo), jnp.where(x > 1, x_gt_1(x_hi), 1 + jnp.log(0.5)))
 
 def gt_nfw_from_profile(r_bins, M, rho_crit_z, c_200c, Sigma_crit):
     # Note: uses units with h as the inputs, which is different from the rest of cosmocnc.
@@ -39,46 +37,101 @@ def gt_nfw_from_profile(r_bins, M, rho_crit_z, c_200c, Sigma_crit):
     DeltaSigma = Sigma_bar - Sigma
     return DeltaSigma / (Sigma_crit - Sigma)
 
+def _F_tau(x, tau):
+    """Truncated-NFW angular function; x = R/r_s, tau = r_t/r_s. Handles x<1 and x>1."""
+    u = (x*x + tau) / (x * (1. + tau))
+    lt1 = x < 1.
+    om = jnp.sqrt(jnp.where(lt1, 1. - x*x, x*x - 1.))          # |1-x^2|^{1/2}, safe
+    val_lt = jnp.arccosh(jnp.maximum(u, 1.)) / om               # x<1: u>=1
+    val_gt = jnp.arccos(jnp.clip(u, -1., 1.)) / om              # x>1: u<=1
+    return jnp.where(lt1, val_lt, val_gt)
+
+def gt_tnfw_from_profile(R_proj, M200c_h, rho_crit_z_h, c_200c, tau, Sigma_crit):
+    """Reduced tangential shear for a HARD-TRUNCATED NFW (rho=0 beyond r_t).
+    Identical conventions/units to gt_nfw_from_profile, plus tau = r_t/r_s.
+    tau -> inf recovers the untruncated result."""
+    m = lambda y: jnp.log(1.+y) - y/(1.+y)
+    r_200 = (3.*M200c_h / (4.*jnp.pi*200.*rho_crit_z_h))**(1./3.)
+    r_s   = r_200 / c_200c
+    rho_s = (200./3.) * rho_crit_z_h * c_200c**3 / m(c_200c)
+
+    x = R_proj / r_s
+    x = jnp.where(jnp.abs(x - 1.) < 1e-6, 1. + 1e-6, x)         # x=1 removable singularity
+    x = jnp.maximum(x, 1e-8)
+    inside = x < tau
+    xc = jnp.minimum(x, tau*(1. - 1e-9))                        # safe args for inside-branch fns
+
+    root = jnp.sqrt(jnp.maximum(tau*tau - xc*xc, 0.))
+    Ft   = _F_tau(xc, tau)
+    Sigma_in  = 2.*rho_s*r_s * (root/(1.+tau) - Ft) / (xc*xc - 1.)
+    Sigma     = jnp.where(inside, Sigma_in, 0.)
+
+    g_in  = m(tau) + root/(1.+tau) - jnp.log((tau + root)/xc) + Ft
+    g_val = jnp.where(inside, g_in, m(tau))
+    Sigma_bar = 4.*rho_s*r_s * g_val / (x*x)
+
+    return (Sigma_bar - Sigma) / (Sigma_crit - Sigma)
+
 def gt_profile_log_lik_grid(lnM_grid,
-                             # per-cluster (from get_layer_sr_params_per_cluster):
+                             # per-cluster (10):
                              R_proj, gt_obs, sigma_g,
-                             rho_crit_z_h, Sigma_crit, c_200c_grid,
-                             # global SR params (from get_profile_sr_params):
-                             b_WL_0, b_WL_M, M_WL_pivot, h_fid):
-    M_grid_h    = jnp.exp(lnM_grid) * 1e14 * h_fid        # (n_pts,) in Msol/h
+                             rho_crit_z_h, Sigma_crit, c_200c_grid, delta_lnM_grid,
+                             lnM_table, ln1pz_ratio, tau_grid,
+                             # global SR params (5):
+                             b_WL_0, b_WL_M, M_WL_pivot, h_fid, b_WL_z):
+    # Table abscissa (grid that c_200c_grid / delta_lnM_grid / tau_grid live on)
+    lnM500c_table_h = lnM_table + jnp.log(1e14 * h_fid)
+    lnM200c_table_h = lnM500c_table_h + delta_lnM_grid
+
+    # Evaluation masses (narrow backward-conv grid)
+    lnM500c_grid_h = lnM_grid + jnp.log(1e14 * h_fid)
+    delta_at_eval  = jnp.interp(lnM500c_grid_h, lnM500c_table_h, delta_lnM_grid)
+    lnM_grid_h     = lnM500c_grid_h + delta_at_eval
+
     lnM_pivot_h = jnp.log(M_WL_pivot * h_fid)
+    valid = jnp.isfinite(gt_obs) & jnp.isfinite(R_proj)
 
-    def _one_mass(M_h, c):
-        ln_MWL = b_WL_0 + b_WL_M * jnp.log(M_h) - b_WL_M * lnM_pivot_h + lnM_pivot_h
+    def _one_mass(lnM_h):
+        ln_MWL = (b_WL_0 + b_WL_z * ln1pz_ratio
+                  + b_WL_M * lnM_h - b_WL_M * lnM_pivot_h + lnM_pivot_h)
         M_wl   = jnp.exp(ln_MWL)
-        c_wl   = jnp.interp(jnp.log(M_wl), jnp.log(M_grid_h), c_200c_grid)
-        R_safe = jnp.where(R_proj > 0., R_proj, 1.)
-        gt_pred = gt_nfw_from_profile(R_safe, M_wl, rho_crit_z_h, c_wl, Sigma_crit)
-        chi2   = jnp.sum(((gt_obs - gt_pred) / sigma_g)**2)
-        return -0.5 * chi2
+        in_bounds = (ln_MWL >= lnM200c_table_h[0]) & (ln_MWL <= lnM200c_table_h[-1])
+        c_wl   = jnp.interp(ln_MWL, lnM200c_table_h, c_200c_grid)
+        tau_wl = jnp.interp(ln_MWL, lnM200c_table_h, tau_grid)
+        R_safe = jnp.where(valid, R_proj, 1.)
+        gt_pred = gt_tnfw_from_profile(R_safe, M_wl, rho_crit_z_h, c_wl, tau_wl, Sigma_crit)
+        per_bin_chi2 = jnp.where(
+            valid & in_bounds,
+            ((gt_obs - gt_pred) / sigma_g) ** 2,
+            jnp.where(valid, 1e4, 0.))
+        return -0.5 * jnp.sum(per_bin_chi2)
 
-    logP = jax.vmap(_one_mass)(M_grid_h, c_200c_grid)
-    logP += (-jnp.sum(jnp.log(sigma_g))
-             -0.5 * gt_obs.size * jnp.log(2.0 * jnp.pi))
-    return logP
+    logP_chi2 = jax.vmap(_one_mass)(lnM_grid_h)
+    norm_const = (-jnp.sum(jnp.where(valid, jnp.log(sigma_g), 0.))
+                  - 0.5 * jnp.sum(valid) * jnp.log(2.0 * jnp.pi))
+    return logP_chi2 + norm_const
 
 # =====================================================================
 # Pure JAX scaling relation functions (JIT-compatible, no class state)
 # =====================================================================
 
-def sr_q_so_sim_layer0(x0, prefactor_logy0, prefactor_M_500_to_theta,
-                        sigma_sz_poly, alpha_szifi):
+def sr_q_so_sim_layer0(x0_500, prefactor_logy0, prefactor_M_500_to_theta,
+                        sigma_sz_poly, alpha_szifi, log_theta_min, log_theta_max):
     """Pure JAX: q_so_sim layer 0: lnM -> log(y0/sigma)."""
-    log_y0 = x0 * alpha_szifi + prefactor_logy0
-    log_theta_500 = jnp.log(prefactor_M_500_to_theta) + x0 / 3.
-    log_sigma_sz = jnp.polyval(sigma_sz_poly, log_theta_500)
+    log_y0 = x0_500 * alpha_szifi + prefactor_logy0
+    log_theta_500 = jnp.log(prefactor_M_500_to_theta) + x0_500 / 3.
+    log_theta_clamped = jnp.clip(log_theta_500, log_theta_min, log_theta_max) 
+    log_sigma_sz = jnp.polyval(sigma_sz_poly, log_theta_clamped)
     x1 = log_y0 - log_sigma_sz
     return x1, log_theta_500
 
-
-def sr_q_so_sim_layer0_deriv(log_theta_500, sigma_sz_polyder, alpha_szifi):
+def sr_q_so_sim_layer0_deriv(log_theta_500, sigma_sz_polyder, alpha_szifi,
+                              log_theta_min, log_theta_max):
     """Pure JAX: derivative of q_so_sim layer 0."""
-    return alpha_szifi - jnp.polyval(sigma_sz_polyder, log_theta_500) / 3.
+    in_domain = (log_theta_500 >= log_theta_min) & (log_theta_500 <= log_theta_max)
+    poly_term = jnp.polyval(sigma_sz_polyder, 
+                            jnp.clip(log_theta_500, log_theta_min, log_theta_max))
+    return alpha_szifi - jnp.where(in_domain, poly_term, 0.) / 3.
 
 
 def sr_q_so_sim_layer1(x0, _pref_logy0, _pref_theta, dof):
@@ -222,7 +275,7 @@ class scaling_relations:
     
     def get_n_profile_sr_params(self):
         if self.observable == "gt":
-            return 4
+            return 5
         return 0
     
     def get_profile_sr_params(self, sr_params):
@@ -230,7 +283,8 @@ class scaling_relations:
             return (jnp.float64(sr_params["b_WL_0"]),
                     jnp.float64(sr_params["b_WL_M"]),
                     jnp.float64(sr_params["M_WL_pivot"]),
-                    jnp.float64(sr_params["h_fid"]))
+                    jnp.float64(sr_params["h_fid"]),
+                    jnp.float64(sr_params["b_WL_z"]))
         return ()
     
     def get_layer_sr_params_per_cluster(self, layer, sr_params):
@@ -246,7 +300,12 @@ class scaling_relations:
                 rho_crit = getattr(self, '_rho_crit_clusters', None)
                 Sigma    = getattr(self, '_Sigma_crit_clusters', None)
                 c_200c   = getattr(self, '_c_200c_clusters', None)
-                return (R_proj, gt_obs, sigma_g, rho_crit, Sigma, c_200c)
+                delta_lnM= getattr(self, '_delta_lnM', None)
+                lnM_table= getattr(self, '_lnM_table_clusters', None)
+                ln1pz    = getattr(self, '_ln1pz_clusters', None)
+                tau = getattr(self, '_tau_clusters', None)
+                return (R_proj, gt_obs, sigma_g, rho_crit, Sigma, c_200c,
+                        delta_lnM, lnM_table, ln1pz, tau)
         return ()
 
     def initialise_scaling_relation(self,cosmology=None):
@@ -288,6 +347,10 @@ class scaling_relations:
             sigma_sz_poly_np = np.polyfit(x,y,deg=3)
             self.sigma_sz_poly = jnp.asarray(sigma_sz_poly_np)
             self.sigma_sz_polyder = jnp.asarray(np.polyder(sigma_sz_poly_np))
+
+            # Domain of the noise-file fit, for clamping (theta in arcmin)
+            self.log_theta_min = float(np.log(self.theta_500_vec.min()))
+            self.log_theta_max = float(np.log(self.theta_500_vec.max()))
 
             self.skyfracs = [0.4] #from SO goals and forecasts paper
 
@@ -662,7 +725,8 @@ class scaling_relations:
         obs = self.observable
         if obs == "q_so_sim":
             if layer == 0:
-                return (self.sigma_sz_poly, jnp.float64(sr_params["alpha_szifi"]))
+                return (self.sigma_sz_poly, jnp.float64(sr_params["alpha_szifi"]),
+                        jnp.float64(self.log_theta_min), jnp.float64(self.log_theta_max))
             elif layer == 1:
                 return (jnp.float64(sr_params["dof"]),)
         elif obs in ("p_so_sim", "p_so_sim_stacked"):
@@ -683,7 +747,8 @@ class scaling_relations:
         obs = self.observable
         if obs == "q_so_sim":
             if layer == 0:
-                return (self.sigma_sz_polyder, jnp.float64(sr_params["alpha_szifi"]))
+                return (self.sigma_sz_polyder, jnp.float64(sr_params["alpha_szifi"]),
+                        jnp.float64(self.log_theta_min), jnp.float64(self.log_theta_max))
             elif layer == 1:
                 return (jnp.float64(sr_params["dof"]),)
         return ()

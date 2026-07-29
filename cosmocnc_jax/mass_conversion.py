@@ -32,7 +32,6 @@ scaling) is reproduced exactly. See port_audit.md SB1 for the residual
 import jax
 import jax.numpy as jnp
 
-
 def _nfw_m(y):
     """NFW dimensionless enclosed mass: m(y) = ln(1+y) - y/(1+y)."""
     return jnp.log1p(y) - y / (1.0 + y)
@@ -275,7 +274,6 @@ def nfw_m500c_over_m200c(c, n_iter=15):
     x0 = jnp.full_like(c, 0.65)  # typical R_500c/R_200c
     x = jax.lax.fori_loop(0, n_iter, step, x0)
     return 2.5 * x**3
-
 
 @jax.jit
 def m200c_to_m500c_b13_direct(M_200c_Msunh, z, Om0, OL0):

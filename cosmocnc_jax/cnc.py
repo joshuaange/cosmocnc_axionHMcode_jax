@@ -13,6 +13,23 @@ import time
 import importlib.util
 import sys
 from itertools import combinations
+from cosmocnc_jax.mass_conversion import _nfw_m, _nfw_m_prime
+
+@jax.jit
+def nfw_m500c_conversions(c500c, n_iter=15):
+    """Given c500c, returns (M200c/M500c, c200c) from the same Newton solve."""
+    m_c500 = _nfw_m(c500c)
+    def step(_, y):
+        cy = c500c * y
+        mc = _nfw_m(cy)
+        F  = 2.5 * y**(-3) - m_c500 / mc
+        Fp = -7.5 * y**(-4) + (m_c500 * c500c * _nfw_m_prime(cy)) / (mc**2)
+        return y - F / Fp
+    y0 = jnp.full_like(c500c, 1.5)
+    y  = jax.lax.fori_loop(0, n_iter, step, y0)
+    M200_over_M500 = (y**3) / 2.5
+    c200c = c500c * y
+    return M200_over_M500, c200c
 
 # =====================================================================
 # Generic factory functions for building JIT-compiled kernels
@@ -497,8 +514,12 @@ def build_backward_conv_1d(layer0_fn, layer1_fn, layer0_returns_aux=False):
             x_l1 = layer1_fn(x_l0_linear)
         residual = x_l1 - obs_val
 
+        # Fixed: Jacobian correction
+        dx1_dx0 = jnp.gradient(x_l1, x_l0_linear)
+        safe_d = jnp.where(dx1_dx0 == 0, 1.0, jnp.abs(dx1_dx0))
+        cpdf = gaussian_1d(residual, 1.0) / safe_d
         # Gaussian PDF (layer-1 scatter = 1)
-        cpdf = gaussian_1d(residual, 1.0)
+        #cpdf = gaussian_1d(residual, 1.0)
 
         # Observable cutoff
         cpdf = jnp.where(apply_cutoff & (x_l1 < cutoff_val), 0., cpdf)
@@ -667,6 +688,7 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
                         sigma_scatter_min, skyfrac, pad_abundance):
         x0 = ln_M
         dn_dx0 = hmf_row
+        #jax.debug.print("START sum={x}", x=simpson(dn_dx0, x=x0))
 
         for k in range(n_layers):
             layer_fn = layer_fns[k]
@@ -698,9 +720,11 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
 
             safe_d = jnp.where(dx1_dx0 == 0, 1.0, dx1_dx0)
             dn_dx1 = jnp.where((dx1_dx0 == 0) | jnp.isnan(dx1_dx0), 0.0, dn_dx0 / safe_d)
+            #jax.debug.print("  L{k} after jacobian: sum={x}", k=k, x=simpson(dn_dx1, x=x1))
 
             # Apply cutoff before interpolation
             dn_dx1 = jnp.where(apply_cut_k & (x1 < cutoff_k), 0., dn_dx1)
+            #jax.debug.print("  L{k} after cutoff:   sum={x}  cutoff={c}", k=k, x=simpson(dn_dx1, x=x1), c=cutoff_k)
 
             # Pad + interpolate to fixed-size grid
             pad = jnp.where(pad_abundance & (scatter_k > sigma_scatter_min),
@@ -709,20 +733,22 @@ def build_abundance_kernel(layer_fns, layer_deriv_fns,
             x_max = jnp.max(x1) + pad
             x1_interp = jnp.linspace(x_min, x_max, n_points)
             dn_dx1 = jnp.interp(x1_interp, x1, dn_dx1, left=0., right=0.)
+            #jax.debug.print("  L{k} after interp:   sum={x}", k=k, x=simpson(dn_dx1, x=x1_interp))
 
             # Convolve with scatter
             dn_dx1 = convolve_1d(x1_interp, dn_dx1, sigma=scatter_k,
                                   sigma_min=sigma_scatter_min)
+            #jax.debug.print("  L{k} after convolve: sum={x}", k=k, x=simpson(dn_dx1, x=x1_interp))
 
             x0 = x1_interp
             dn_dx0 = dn_dx1
 
         # Final: interpolate to obs_select_vec
         abundance = jnp.interp(obs_select_vec, x0, dn_dx0, left=0.) * 4. * jnp.pi * skyfrac
+        #jax.debug.print("END abundance sum={x}", x=jnp.sum(abundance))
         return abundance
 
     return abundance_one_z
-
 
 class cluster_number_counts:
 
@@ -1153,6 +1179,7 @@ class cluster_number_counts:
                     pc_pl  = all_profile_pc[pl_idx]
                     # Call: fn(lnM, *per_cluster_data, *global_sr_params)
                     log_lik_grid = profile_log_lik_fns[pl_idx](lnM, *pc_pl, *psr_pl)
+                    GT_TEST_SCALE = 3.0
                     cpdf_product = cpdf_product * jnp.where(pl_has, jnp.exp(log_lik_grid), 1.)
 
                 # 1-layer observables: direct Gaussian PDF (no backward conv)
@@ -1256,7 +1283,7 @@ class cluster_number_counts:
                 _profile_n_pc.append(sr.get_n_profile_pc_params())
             elif hasattr(sr, 'get_layer_sr_params_per_cluster'):
                 # Try with dummy data — count without relying on injected attrs
-                _profile_n_pc.append(6 if o == "gt" else 0)
+                _profile_n_pc.append(10 if o == "gt" else 0)
             else:
                 _profile_n_pc.append(0)
 
@@ -1690,7 +1717,9 @@ class cluster_number_counts:
                         'rho_crit'   : np.array([d['rho_crit']     for d in profile_params_list]),
                         'r_s'        : np.vstack([np.asarray(d['r_s']).ravel()
                                                    for d in profile_params_list]),        # (n_z, n_M_coarse)
-                        'concentration_200c'        : np.vstack([np.asarray(d['concentration_200c']).ravel()
+                        'concentration_virial'        : np.vstack([np.asarray(d['concentration_virial']).ravel()
+                                                   for d in profile_params_list]),        # (n_z, n_M_coarse)
+                        'concentration_500c'        : np.vstack([np.asarray(d['concentration_500c']).ravel()
                                                    for d in profile_params_list]),        # (n_z, n_M_coarse)
                         'delta_char' : np.vstack([np.asarray(d['delta_char']).ravel()
                                                    for d in profile_params_list]),        # (n_z, n_M_coarse)
@@ -1727,50 +1756,29 @@ class cluster_number_counts:
             raise RuntimeError(
                 "profile_params not available. Call get_hmf(return_profile_params=True) first.")
     
-        z_grid   = np.asarray(self.redshift_vec)   # (n_z,)
-        M_coarse = np.asarray(self.profile_params['M_vec'])   # (n_M_coarse,) in M_sun
-        lnM_coarse = np.log(M_coarse / 1e14)                  # same units as lnM_arr
-
+        z_grid     = np.asarray(self.redshift_vec)
+        M_coarse   = np.asarray(self.profile_params['M_vec'])
+        lnM_coarse = np.log(M_coarse / 1e14)
+        z_arr      = np.asarray(z_arr)
         n_cl, n_mass = lnM_arr.shape
-
-        r_s_out        = np.zeros((n_cl, n_mass))
-        delta_char_out = np.zeros((n_cl, n_mass))
-        r_vir_out = np.zeros((n_cl, n_mass))
-        concentration_200c_out = np.zeros((n_cl, n_mass))
     
-        for i in range(n_cl):
+        iz  = np.argmin(np.abs(z_grid[:, None] - z_arr[None, :]), axis=0)
+        idx = np.clip(np.searchsorted(lnM_coarse, lnM_arr) - 1, 0, len(lnM_coarse) - 2)
+        x0, x1 = lnM_coarse[idx], lnM_coarse[idx + 1]
+        t = np.clip((lnM_arr - x0) / (x1 - x0), 0., 1.)
     
-            iz = int(np.argmin(np.abs(z_grid - z_arr[i])))
-    
-            r_s_out[i] = np.interp(
-                lnM_arr[i],
-                lnM_coarse,
-                self.profile_params["r_s"][iz]
-            )
-    
-            delta_char_out[i] = np.interp(
-                lnM_arr[i],
-                lnM_coarse,
-                self.profile_params["delta_char"][iz]
-            )
-
-            r_vir_out[i] = np.interp(lnM_arr[i], lnM_coarse, self.profile_params["R_vir"][iz])
-
-            concentration_200c_out[i] =  np.interp(
-                lnM_arr[i],
-                lnM_coarse,
-                self.profile_params["concentration_200c"][iz]
-            )
-
-    
-        rho_m = float(self.profile_params['rho_m'][0])
+        def interp_field(key):
+            arr = np.asarray(self.profile_params[key])       # (n_z, n_coarse)
+            y0 = arr[iz[:, None], idx]                        # (n_cl, n_mass)
+            y1 = arr[iz[:, None], idx + 1]                    # (n_cl, n_mass)
+            return y0 + t * (y1 - y0)
     
         return {
-            'r_s':        r_s_out,
-            'delta_char': delta_char_out,
-            'rho_m':      rho_m,
-            'R_vir':      r_vir_out,
-            'concentration_200c':      concentration_200c_out,
+            'r_s':                interp_field('r_s'),
+            'delta_char':         interp_field('delta_char'),
+            'rho_m':              float(self.profile_params['rho_m'][0]),
+            'R_vir':               interp_field('R_vir'),
+            'concentration_500c': interp_field('concentration_500c'),
         }
 
 
@@ -2221,6 +2229,22 @@ class cluster_number_counts:
                 lnM0_min, lnM0_max, lnM_coarse,
                 patch_clusters)
 
+            # ── static integration windows (defect #4 fix) ──────────────────
+            # Windows are numerical domain choices; deriving them from sampled
+            # parameters made ln_L depend on window placement (frozen-window
+            # test, 2026-07). Compute once at first call (= fiducial warm-up),
+            # widen, and never move again. Physics tables stay live.
+            if not hasattr(self, "_static_lnM_bounds"):
+                WINDOW_MARGIN = 2.0   # e-folds beyond the fiducial SZ-derived span
+                lo = np.maximum(np.asarray(lnM_min) - WINDOW_MARGIN, float(self.ln_M[0]))
+                hi = np.minimum(np.asarray(lnM_max) + WINDOW_MARGIN, float(self.ln_M[-1]))
+                self._static_lnM_bounds = (jnp.asarray(lo), jnp.asarray(hi))
+            lnM_min, lnM_max = self._static_lnM_bounds
+
+            #################################### 
+            self.lnM_min = lnM_min
+            self.lnM_max = lnM_max
+
             # ── Stage 3: All-in-one backward conv + combine + integrate (single JIT) ──
             # Use pre-stacked obs arrays (immutable, cached)
             all_obs_vals = self._bc_cached['all_obs_vals']
@@ -2498,24 +2522,65 @@ class cluster_number_counts:
 
             # Injection block
             if n_profile > 0 and "gt" in self._profile_obs_list:
-                lnM_for_profile = np.tile(np.asarray(lnM_coarse), (n_bc, 1))
-                profile = self.get_profile_params_at_clusters(np.asarray(z_clusters), lnM_for_profile)
-                h_fid = float(self.scal_rel_params["h_fid"])
+                if not getattr(self, "_gt_freeze", False):
+                    lnM_min_np = np.asarray(lnM_min)
+                    lnM_max_np = np.asarray(lnM_max)
                 
-                iz_wl = np.argmin(
-                    np.abs(np.asarray(self.redshift_vec)[:, None]
-                           - np.asarray(z_clusters)[None, :]), axis=0)
+                    GT_PROFILE_MARGIN = 6.0   # in lnM units (natural log of M/1e14); generous,
+                                                # covers order-of-magnitude mass disagreements
+                    lnM0_min_np = float(self.ln_M[0])   # global HMF grid bounds, already available
+                    lnM0_max_np = float(self.ln_M[-1])
+                
+                    lnM_min_wide = np.maximum(lnM_min_np - GT_PROFILE_MARGIN, lnM0_min_np)
+                    lnM_max_wide = np.minimum(lnM_max_np + GT_PROFILE_MARGIN, lnM0_max_np)
+                
+                    t = np.linspace(0., 1., n_points_dl)
+                    lnM_for_profile = lnM_min_wide[:, None] + t[None, :] * (lnM_max_wide - lnM_min_wide)[:, None]
+                    profile = self.get_profile_params_at_clusters(np.asarray(z_clusters), lnM_for_profile)
+                
+                    h_fid = float(self.scal_rel_params["h_fid"])
+                
+                    iz_wl = np.argmin(
+                        np.abs(np.asarray(self.redshift_vec)[:, None]
+                               - np.asarray(z_clusters)[None, :]), axis=0)
+                
+                    rho_crit_h = np.asarray(self.rho_c)[iz_wl] / h_fid**2
+                    c_500c = profile["concentration_500c"]
+                    Sigma_crit_vec_h = self.cosmo_params["Sigma_crit_vec"][iz_wl] / h_fid
+                    M200_over_M500, c_200c = nfw_m500c_conversions(c_500c)
 
-                rho_crit_h = np.asarray(self.rho_c)[iz_wl] / h_fid**2   # (n_bc,)
-                c_200c = profile["concentration_200c"]
-                Sigma_crit_vec_h = self.cosmo_params["Sigma_crit_vec"][iz_wl] / h_fid
+                    # tau = r_t / r_s with r_t = R_vir, from the same profile dict /
+                    # same lnM_for_profile grid as c -> gridding consistent by construction.
+                    # Dimensionless ratio: units of R_vir and r_s cancel.
+                    tau_tab = np.asarray(profile["R_vir"]) / np.asarray(profile["r_s"])
+
+                    # first-call sanity: rho_s = (200/3) rho_c c^3/m(c) requires r_t >= r_200,
+                    # i.e. tau >= c_200c (else the M200c normalization is invalid).
+                    if not getattr(self, "_tau_checked", False):
+                        _c_np = np.asarray(c_200c)
+                        frac_bad = float(np.mean(np.asarray(tau_tab) < _c_np))
+                        #print(f"[gt tNFW] tau: median={np.median(tau_tab):.2f}  "
+                        #      f"range=[{tau_tab.min():.2f},{tau_tab.max():.2f}]  "
+                        #      f"frac(tau<c_200c)={frac_bad:.2%}")
+                        assert frac_bad < 0.01, \
+                            "r_t < r_200 for >1% of table -> rho_s normalization invalid; stop and report"
+                        self._tau_checked = True
+
+                    self.scaling_relations["gt"]._tau_clusters = jnp.asarray(tau_tab)
+                
+                    self.scaling_relations["gt"]._rho_crit_clusters   = (rho_crit_h)
+                    self.scaling_relations["gt"]._Sigma_crit_clusters = (Sigma_crit_vec_h)
+                    self.scaling_relations["gt"]._c_200c_clusters     = (c_200c)
+                    self.scaling_relations["gt"]._delta_lnM           = jnp.log(M200_over_M500)
+                    self.scaling_relations["gt"]._lnM_table_clusters  = jnp.asarray(lnM_for_profile)  # (n_bc, n_pts), ln(M500c/1e14)
     
-                self.scaling_relations["gt"]._rho_crit_clusters  = (rho_crit_h)          # (n_bc,) Msol/h/(Mpc/h)³
-                self.scaling_relations["gt"]._Sigma_crit_clusters = (Sigma_crit_vec_h)          # (n_bc,) Msol/h/(Mpc/h)²
-                self.scaling_relations["gt"]._c_200c_clusters = (c_200c)        
-
-                if hasattr(self, '_pc_slice_cache'):
-                    self._pc_slice_cache.pop(('gt', 0), None)
+                    z_wl_piv = float(self.scal_rel_params.get("z_WL_pivot", 0.4))
+                    z_full = jnp.asarray(self.catalogue.catalogue["z"])
+                    self.scaling_relations["gt"]._ln1pz_clusters = \
+                        jnp.log((1. + z_full) / (1. + z_wl_piv))
+                    
+                    if hasattr(self, '_pc_slice_cache'):
+                        self._pc_slice_cache.pop(('gt', 0), None)
 
             all_profile_pc = ()
             if n_profile > 0:
