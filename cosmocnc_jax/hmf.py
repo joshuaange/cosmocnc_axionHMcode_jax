@@ -260,7 +260,7 @@ class halo_mass_function:
             
                 g_a = (np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.D_grid_full)
                            * self.cosmology.normalisation_cached * (1 + redshift))
-                G_a = self.cosmology.G_a_cached
+                G_a = np.interp(redshift, self.cosmology.D_grid_z_full, self.cosmology.G_a_cached)
                 Delta_vir = func_axionHMcode_Delta_vir(redshift, Om0, G_a, E_z, g_a)
             
                 c_min   = 5.196

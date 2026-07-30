@@ -2234,8 +2234,8 @@ class cluster_number_counts:
             # parameters made ln_L depend on window placement (frozen-window
             # test, 2026-07). Compute once at first call (= fiducial warm-up),
             # widen, and never move again. Physics tables stay live.
-            if not hasattr(self, "_static_lnM_bounds"):
-                WINDOW_MARGIN = 2.0   # e-folds beyond the fiducial SZ-derived span
+            if not hasattr(self, "_static_lnM_bounds") or self._static_lnM_bounds is None:
+                WINDOW_MARGIN = 5.0   # e-folds beyond the fiducial SZ-derived span
                 lo = np.maximum(np.asarray(lnM_min) - WINDOW_MARGIN, float(self.ln_M[0]))
                 hi = np.minimum(np.asarray(lnM_max) + WINDOW_MARGIN, float(self.ln_M[-1]))
                 self._static_lnM_bounds = (jnp.asarray(lo), jnp.asarray(hi))
